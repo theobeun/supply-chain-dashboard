@@ -514,6 +514,27 @@ header {
       <a onclick="hideForgotPassword()">← Back to sign in</a>
     </div>
   </div>
+
+  <!-- New password form (shown after clicking reset link from email) -->
+  <div class="login-card" id="newPasswordCard" style="display:none">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:24px">
+      <div class="header-icon"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
+      <span style="font-size:16px;font-weight:600">Supply Chain Dashboard</span>
+    </div>
+    <h2>Set new password</h2>
+    <p class="subtitle">Enter your new password below</p>
+    <div class="login-field">
+      <label>New password</label>
+      <input type="password" id="newPassword" placeholder="••••••••" onkeydown="if(event.key==='Enter')updatePassword()">
+    </div>
+    <div class="login-field">
+      <label>Confirm new password</label>
+      <input type="password" id="confirmPassword" placeholder="••••••••" onkeydown="if(event.key==='Enter')updatePassword()">
+    </div>
+    <button class="login-btn" id="updatePwBtn" onclick="updatePassword()">Update password</button>
+    <div class="login-error" id="newPwError"></div>
+    <div class="login-success" id="newPwSuccess"></div>
+  </div>
 </div>
 
 <!-- ══════ MAIN APP (hidden until logged in) ══════ -->
@@ -1580,11 +1601,68 @@ async function sendToAPI(seriesPayload) {
   return await r.json();
 }
 
-// Auto-login if session exists
+// ── Update password (after clicking reset link from email) ──
+async function updatePassword() {
+  const pw = document.getElementById('newPassword').value;
+  const confirm = document.getElementById('confirmPassword').value;
+  const errEl = document.getElementById('newPwError');
+  const succEl = document.getElementById('newPwSuccess');
+  errEl.style.display = 'none'; succEl.style.display = 'none';
+
+  if (!pw || !confirm) { errEl.textContent = 'Please fill in both fields'; errEl.style.display = 'block'; return; }
+  if (pw.length < 6) { errEl.textContent = 'Password must be at least 6 characters'; errEl.style.display = 'block'; return; }
+  if (pw !== confirm) { errEl.textContent = 'Passwords do not match'; errEl.style.display = 'block'; return; }
+
+  document.getElementById('updatePwBtn').textContent = 'Updating…';
+  document.getElementById('updatePwBtn').disabled = true;
+
+  try {
+    const { error } = await _supabase.auth.updateUser({ password: pw });
+    if (error) throw error;
+    succEl.textContent = 'Password updated! Redirecting to dashboard…';
+    succEl.style.display = 'block';
+    setTimeout(() => {
+      document.getElementById('newPasswordCard').style.display = 'none';
+      // Clear the hash from URL
+      history.replaceState(null, '', window.location.pathname);
+      onLoginSuccess();
+    }, 1500);
+  } catch (err) {
+    errEl.textContent = err.message || 'Could not update password';
+    errEl.style.display = 'block';
+    document.getElementById('updatePwBtn').textContent = 'Update password';
+    document.getElementById('updatePwBtn').disabled = false;
+  }
+}
+
+// Auto-login if session exists, detect password recovery
 (async () => {
+  // Listen for auth changes — this catches the PASSWORD_RECOVERY event from the reset link
+  _supabase.auth.onAuthStateChange((event, session) => {
+    if (session) _currentSession = session;
+
+    if (event === 'PASSWORD_RECOVERY') {
+      // User clicked the reset link — show the new password form
+      document.getElementById('loginPage').classList.remove('hidden');
+      document.getElementById('appMain').classList.remove('visible');
+      // Hide login and forgot cards, show new password card
+      document.querySelector('#loginPage > .login-card').style.display = 'none';
+      document.getElementById('forgotCard').style.display = 'none';
+      document.getElementById('newPasswordCard').style.display = 'block';
+    }
+  });
+
   const { data } = await _supabase.auth.getSession();
-  if (data.session) { _currentSession = data.session; onLoginSuccess(); }
-  _supabase.auth.onAuthStateChange((ev, session) => { if (session) _currentSession = session; });
+  if (data.session) {
+    _currentSession = data.session;
+    // Check if this is a recovery session (URL has recovery token)
+    const hash = window.location.hash;
+    if (hash && hash.includes('type=recovery')) {
+      // Don't auto-login, wait for PASSWORD_RECOVERY event
+    } else {
+      onLoginSuccess();
+    }
+  }
 })();
 
 // ══════════════════════════════════════════════════════════════
@@ -1906,1734 +1984,6 @@ function showStatus(msg, type) {
 // ██ MACHINE LEARNING ENGINE — faithful to app.py
 // ██ Ridge + XGBoost (gradient/hessian, L1/L2, gamma)
 // ██ Mutual information feature selection
-// ██ Nested time-series CV, common outer splits, no data leakage
-// ══════════════════════════════════════════════════════════════
-
-const ML = (() => {
-  // ── Math helpers ──
-  const mean = a => { let s=0; for(let i=0;i<a.length;i++) s+=a[i]; return a.length?s/a.length:0; };
-  const std = a => { const m=mean(a); let s=0; for(let i=0;i<a.length;i++) s+=(a[i]-m)**2; return Math.sqrt(s/Math.max(1,a.length-1)); };
-  const medianOf = a => { const s=[...a].sort((x,y)=>x-y); const m=Math.floor(s.length/2); return s.length%2?s[m]:(s[m-1]+s[m])/2; };
-  const maeScore = (y,p) => { let s=0; for(let i=0;i<y.length;i++) s+=Math.abs(y[i]-p[i]); return s/y.length; };
-  const rmseScore = (y,p) => { let s=0; for(let i=0;i<y.length;i++) s+=(y[i]-p[i])**2; return Math.sqrt(s/y.length); };
-  const pearson = (x,y) => { const n=x.length; if(n<3)return 0; const mx=mean(x),my=mean(y); let num=0,dx=0,dy=0; for(let i=0;i<n;i++){num+=(x[i]-mx)*(y[i]-my);dx+=(x[i]-mx)**2;dy+=(y[i]-my)**2;} const d=Math.sqrt(dx*dy); return d===0?0:num/d; };
-  const rng = () => Math.random();
-  const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
-  const clip = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-
-  // MUTUAL INFORMATION REGRESSION - KNN (Kraskov/KSG) estimator
-  // Mirrors sklearn mutual_info_regression (KSG algorithm 1)
-  // More accurate than histogram binning for continuous variables
-
-  function _digamma(x) {
-    if(x <= 0) return 0;
-    let result = 0;
-    while(x < 6) { result -= 1/x; x += 1; }
-    const x2 = 1/(x*x);
-    result += Math.log(x) - 0.5/x - x2*(1/12 - x2*(1/120 - x2/252));
-    return result;
-  }
-
-  function _addNoise(vals, scale) {
-    return vals.map(v => v + (Math.random()-0.5)*2e-10*scale);
-  }
-
-  // KSG Algorithm 1 for MI(x, y)
-  function mutualInfoScore(xRaw, yRaw, k) {
-    const n = xRaw.length; if(n < 6) return 0;
-    k = k || 3;
-    const xMin=Math.min(...xRaw), xMax=Math.max(...xRaw);
-    const yMin=Math.min(...yRaw), yMax=Math.max(...yRaw);
-    const xRange=xMax-xMin||1, yRange=yMax-yMin||1;
-    const x = _addNoise(xRaw.map(v=>(v-xMin)/xRange), 1);
-    const y = _addNoise(yRaw.map(v=>(v-yMin)/yRange), 1);
-
-    let sumDiNx = 0, sumDiNy = 0;
-
-    for(let i=0;i<n;i++){
-      // Chebyshev distances in joint space
-      const dists = new Array(n);
-      for(let j=0;j<n;j++){
-        if(j===i){ dists[j]=Infinity; continue; }
-        dists[j] = Math.max(Math.abs(x[i]-x[j]), Math.abs(y[i]-y[j]));
-      }
-      // k-th nearest neighbor distance (partial sort via full sort)
-      const sorted = [...dists].sort((a,b)=>a-b);
-      const eps = sorted[k-1];
-
-      // Count points strictly closer than eps in each marginal
-      let nx=0, ny=0;
-      for(let j=0;j<n;j++){
-        if(j===i) continue;
-        if(Math.abs(x[i]-x[j]) < eps) nx++;
-        if(Math.abs(y[i]-y[j]) < eps) ny++;
-      }
-      sumDiNx += _digamma(nx + 1);
-      sumDiNy += _digamma(ny + 1);
-    }
-
-    const mi = _digamma(k) - (sumDiNx + sumDiNy)/n + _digamma(n);
-    return Math.max(0, mi);
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // FEATURE SELECTION by mutual information (like sklearn SelectKBest)
-  // ══════════════════════════════════════════════════════════
-  function selectKBestMI(X, y, k) {
-    const n = X.length, p = X[0]?.length||0;
-    if(k<=0 || k>=p) return {idx: Array.from({length:p},(_,i)=>i), X};
-
-    // ── Step 1: Standard MI-based selection ──
-    const scores = [];
-    for(let j=0;j<p;j++){
-      const col = X.map(r=>r[j]);
-      scores.push({j, score: mutualInfoScore(col, y)});
-    }
-    scores.sort((a,b) => b.score - a.score);
-    const selectedSet = new Set(scores.slice(0,k).map(s=>s.j));
-    const eliminated = scores.slice(k);
-
-    // ── Step 2: Dormant feature watchlist ──
-    // Check if any eliminated feature has "woken up" recently.
-    // A dormant feature is one with low global MI, but whose recent values
-    // deviate significantly (>2σ) from its historical mean.
-    // This catches features stable at 99% of the time that move at the
-    // critical moment — exactly the ones variance/MI filters miss.
-    const recentWindow = Math.max(3, Math.floor(n * 0.15)); // last 15% of rows
-    const WAKE_SIGMA = 2.0;   // z-score threshold to consider a feature "awake"
-    const MAX_REINSERT = Math.max(2, Math.floor(k * 0.20)); // cap reinsertions at 20% of k
-    let reinserted = 0;
-
-    for(const {j, score} of eliminated){
-      if(reinserted >= MAX_REINSERT) break;
-
-      const col = X.map(r=>r[j]);
-      // Historical stats (all rows except the recent window)
-      const histEnd = Math.max(1, n - recentWindow);
-      const histVals = col.slice(0, histEnd).filter(v => isFinite(v));
-      if(histVals.length < 5) continue;
-      const histMu = mean(histVals);
-      const histSigma = std(histVals);
-      if(histSigma < 1e-12) {
-        // Near-constant feature: any change at all is significant
-        const recentVals = col.slice(histEnd).filter(v => isFinite(v));
-        const recentMu = recentVals.length ? mean(recentVals) : histMu;
-        if(Math.abs(recentMu - histMu) > 1e-9) {
-          selectedSet.add(j);
-          reinserted++;
-        }
-        continue;
-      }
-
-      // Check if recent values deviate beyond threshold
-      const recentVals = col.slice(histEnd).filter(v => isFinite(v));
-      if(!recentVals.length) continue;
-      const recentMu = mean(recentVals);
-      const zScore = Math.abs(recentMu - histMu) / histSigma;
-
-      if(zScore > WAKE_SIGMA) {
-        selectedSet.add(j);
-        reinserted++;
-      }
-    }
-
-    const idx = [...selectedSet].sort((a,b)=>a-b);
-    return {idx, X: X.map(r=>idx.map(j=>r[j]))};
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // PREPROCESSING (impute, scale) — fit on train only
-  // ══════════════════════════════════════════════════════════
-  function imputeMedian(X) {
-    const n=X.length, p=X[0]?.length||0, out=X.map(r=>[...r]);
-    for(let j=0;j<p;j++){
-      const vals=[]; for(let i=0;i<n;i++) if(isFinite(out[i][j])) vals.push(out[i][j]);
-      const med=vals.length?medianOf(vals):0;
-      for(let i=0;i<n;i++) if(!isFinite(out[i][j])) out[i][j]=med;
-    }
-    return out;
-  }
-
-  function standardize(X) {
-    const n=X.length, p=X[0]?.length||0, means=[], stds=[], out=X.map(r=>[...r]);
-    for(let j=0;j<p;j++){
-      const col=[]; for(let i=0;i<n;i++) col.push(out[i][j]);
-      const m=mean(col), s=std(col)||1;
-      means.push(m); stds.push(s);
-      for(let i=0;i<n;i++) out[i][j]=(out[i][j]-m)/s;
-    }
-    return {X:out, means, stds};
-  }
-
-  function applyScale(X, means, stds) {
-    return X.map(r=>r.map((v,j)=>(v-(means[j]||0))/((stds[j])||1)));
-  }
-
-  // preprocessFold: fit imputer+scaler on train, transform both (NO LEAKAGE)
-  function preprocessFold(Xtr, Xte) {
-    const Xtr_imp = imputeMedian(Xtr);
-    const sc = standardize(Xtr_imp);
-    // Compute medians from train for imputing test
-    const p = Xtr[0]?.length||0;
-    const medians = [];
-    for(let j=0;j<p;j++){
-      const vals=[]; for(let i=0;i<Xtr.length;i++) if(isFinite(Xtr[i][j])) vals.push(Xtr[i][j]);
-      medians.push(vals.length?medianOf(vals):0);
-    }
-    const Xte_imp = Xte.map(r=>r.map((v,j)=>isFinite(v)?v:medians[j]));
-    const Xte_sc = applyScale(Xte_imp, sc.means, sc.stds);
-    return {Xtr_sc: sc.X, Xte_sc, means: sc.means, stds: sc.stds, medians};
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // TIME SERIES CV SPLITS (like sklearn TimeSeriesSplit)
-  // ══════════════════════════════════════════════════════════
-  function tscvSplits(n, nSplits) {
-    const splits = [], foldSize = Math.floor(n/(nSplits+1));
-    if(foldSize<5) {
-      // Fallback for short series: single train/test split
-      const cut=Math.floor(n*0.7);
-      if(cut>=8 && n-cut>=3) return [[_range(0,cut), _range(cut,n)]];
-      // Ultra-short fallback: 60/40 split
-      const cut2=Math.floor(n*0.6);
-      if(cut2>=6 && n-cut2>=3) return [[_range(0,cut2), _range(cut2,n)]];
-      return [];
-    }
-    for(let i=0;i<nSplits;i++){
-      const testEnd = (i+2)*foldSize + (i===nSplits-1 ? n%(nSplits+1) : 0);
-      const testStart = (i+1)*foldSize + (i===nSplits-1 && i>0 ? 0 : 0);
-      const trainEnd = (i+1)*foldSize;
-      if(trainEnd<8 || testEnd-trainEnd<3 || testEnd>n) continue;
-      splits.push([_range(0,trainEnd), _range(trainEnd,testEnd)]);
-    }
-    return splits.length?splits:(_fallback(n));
-  }
-  function _range(a,b){return Array.from({length:b-a},(_,i)=>a+i);}
-  function _fallback(n){const c=Math.floor(n*0.7);return c>=6&&n-c>=3?[[_range(0,c),_range(c,n)]]:[];}
-
-  // Common outer splits — SAME folds for Ridge and XGB (like app.py)
-  function commonOuterSplits(nRows, cfg) {
-    const nSplits = cfg.nSplits;
-    return tscvSplits(nRows, nSplits);
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // RIDGE REGRESSION — (X'X + αI)w = X'y via Gaussian elimination
-  // ══════════════════════════════════════════════════════════
-  function _gaussSolve(A, b) {
-    const n=A.length, aug=A.map((r,i)=>[...r,b[i]]);
-    for(let col=0;col<n;col++){
-      let maxR=col; for(let r=col+1;r<n;r++) if(Math.abs(aug[r][col])>Math.abs(aug[maxR][col]))maxR=r;
-      [aug[col],aug[maxR]]=[aug[maxR],aug[col]];
-      if(Math.abs(aug[col][col])<1e-12)continue;
-      const piv=aug[col][col];
-      for(let j=col;j<=n;j++)aug[col][j]/=piv;
-      for(let r=0;r<n;r++){
-        if(r===col)continue;
-        const f=aug[r][col]; for(let j=col;j<=n;j++)aug[r][j]-=f*aug[col][j];
-      }
-    }
-    return aug.map(r=>r[n]);
-  }
-
-  function ridgeFit(X, y, alpha) {
-    const n=X.length, p=X[0].length;
-    const XtX=Array.from({length:p},()=>new Array(p).fill(0));
-    const Xty=new Array(p).fill(0);
-    for(let i=0;i<n;i++) for(let j=0;j<p;j++){
-      Xty[j]+=X[i][j]*y[i];
-      for(let k=j;k<p;k++){const v=X[i][j]*X[i][k];XtX[j][k]+=v;if(j!==k)XtX[k][j]+=v;}
-    }
-    for(let j=0;j<p;j++) XtX[j][j]+=alpha;
-    return _gaussSolve(XtX, Xty);
-  }
-
-  function ridgePredict(X, w) {
-    return X.map(r=>{let s=0;for(let j=0;j<r.length;j++)s+=r[j]*w[j];return s;});
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // TPE (Tree of Parzen Estimators) — Bayesian hyperparameter optimization
-  // Mirrors Optuna/HyperOpt TPE: splits trials into good/bad by gamma quantile,
-  // models l(x) and g(x) with KDE, picks argmax l(x)/g(x).
-  // ══════════════════════════════════════════════════════════
-
-  // Search-space entry types:
-  //   {name, type:'categorical', values:[...]}         — pick from list
-  //   {name, type:'logUniform', low, high}             — log-uniform continuous
-  //   {name, type:'conditional', condition:{param,val}, then:entry, else:entry}
-
-  const TPE = (() => {
-    const GAMMA = 0.25;          // top 25% = "good"
-    const N_STARTUP = 5;         // random trials before TPE kicks in
-    const N_EI_CANDIDATES = 24;  // candidates scored by EI each round
-    const PRIOR_WEIGHT = 1.0;    // uniform prior weight (smoothing)
-
-    // ── Sample one value uniformly from a search-space entry ──
-    function _sampleUniform(entry) {
-      if(entry.type === 'categorical') return pick(entry.values);
-      if(entry.type === 'logUniform')  return Math.exp(rng()*(Math.log(entry.high)-Math.log(entry.low))+Math.log(entry.low));
-      return entry.values ? pick(entry.values) : 0;
-    }
-
-    // ── KDE log-likelihood for a single value given observations ──
-
-    // Categorical: weighted frequency + uniform prior
-    function _catLogLik(val, obs, allValues) {
-      const nObs = obs.length;
-      const count = obs.filter(v => v === val).length;
-      const k = allValues.length;
-      // Smoothed probability: (count + prior/k) / (nObs + prior)
-      return Math.log((count + PRIOR_WEIGHT/k) / (nObs + PRIOR_WEIGHT));
-    }
-
-    // Log-uniform continuous: Gaussian KDE in log-space
-    function _logUniLogLik(val, obs, low, high) {
-      const logVal = Math.log(val);
-      const logObs = obs.map(v => Math.log(v));
-      const n = logObs.length;
-      if(n === 0) return -Math.log(Math.log(high) - Math.log(low)); // uniform prior
-      // Silverman bandwidth
-      const mu = logObs.reduce((s,v)=>s+v,0)/n;
-      const variance = logObs.reduce((s,v)=>s+(v-mu)**2,0)/n;
-      const sigma = Math.sqrt(variance) || 1.0;
-      const bw = 1.06 * sigma * Math.pow(n, -0.2);
-      // KDE: average of Gaussians
-      let logSum = -Infinity;
-      for(let i=0;i<n;i++){
-        const z = (logVal - logObs[i]) / bw;
-        const logPdf = -0.5*z*z - Math.log(bw) - 0.9189; // 0.9189 ≈ 0.5*log(2π)
-        // log-sum-exp
-        if(logPdf > logSum) { logSum = logPdf + Math.log(1 + Math.exp(logSum - logPdf)); }
-        else { logSum = logSum + Math.log(1 + Math.exp(logPdf - logSum)); }
-      }
-      return logSum - Math.log(n);
-    }
-
-    // ── Compute log l(x) or log g(x) for a full parameter set ──
-    function _logLik(params, observations, space) {
-      let ll = 0;
-      for(const entry of space){
-        const val = params[entry.name];
-        const obs = observations.map(o => o[entry.name]);
-        if(entry.type === 'categorical'){
-          ll += _catLogLik(val, obs, entry.values);
-        } else if(entry.type === 'logUniform'){
-          ll += _logUniLogLik(val, obs, entry.low, entry.high);
-        }
-      }
-      return ll;
-    }
-
-    // ── Main TPE suggest function ──
-    // observations: [{params:{...}, loss:number}, ...]
-    // Returns: suggested params object
-    function suggest(space, observations) {
-      // Warm-up: pure random
-      if(observations.length < N_STARTUP){
-        const p = {};
-        for(const entry of space) p[entry.name] = _sampleUniform(entry);
-        return p;
-      }
-
-      // Sort by loss, split into good (gamma quantile) and bad
-      const sorted = [...observations].sort((a,b) => a.loss - b.loss);
-      const nGood = Math.max(1, Math.floor(GAMMA * sorted.length));
-      const good = sorted.slice(0, nGood).map(o => o.params);
-      const bad  = sorted.slice(nGood).map(o => o.params);
-
-      // Sample candidates, score by log l(x) - log g(x)
-      let bestCandidate = null, bestScore = -Infinity;
-      for(let c=0; c<N_EI_CANDIDATES; c++){
-        // Sample from l(x): for categoricals, weighted by good frequencies;
-        // for logUniform, sample from good KDE
-        const candidate = {};
-        for(const entry of space){
-          // 80% from good model, 20% uniform exploration
-          if(rng() < 0.2){
-            candidate[entry.name] = _sampleUniform(entry);
-          } else {
-            if(entry.type === 'categorical'){
-              // Weighted sample from good observations
-              const counts = {};
-              for(const v of entry.values) counts[v] = PRIOR_WEIGHT/entry.values.length;
-              for(const g of good) counts[g[entry.name]] = (counts[g[entry.name]]||0) + 1;
-              const total = Object.values(counts).reduce((s,v)=>s+v,0);
-              let r = rng()*total, cum=0;
-              for(const v of entry.values){ cum+=counts[v]; if(r<=cum){ candidate[entry.name]=v; break; } }
-              if(!(entry.name in candidate)) candidate[entry.name] = entry.values[entry.values.length-1];
-            } else if(entry.type === 'logUniform'){
-              // Sample from KDE of good observations in log-space
-              const goodVals = good.map(g => Math.log(g[entry.name]));
-              const mu = goodVals.reduce((s,v)=>s+v,0)/goodVals.length;
-              const variance = goodVals.reduce((s,v)=>s+(v-mu)**2,0)/goodVals.length;
-              const sigma = Math.sqrt(variance) || 1.0;
-              const bw = 1.06 * sigma * Math.pow(goodVals.length, -0.2);
-              // Pick a random good observation, add Gaussian noise
-              const base = goodVals[Math.floor(rng()*goodVals.length)];
-              let logSample = base + bw * _gaussRandom();
-              // Clip to bounds
-              logSample = Math.max(Math.log(entry.low), Math.min(Math.log(entry.high), logSample));
-              candidate[entry.name] = Math.exp(logSample);
-            }
-          }
-        }
-
-        // Score: log l(x) - log g(x)
-        const logL = _logLik(candidate, good, space);
-        const logG = bad.length > 0 ? _logLik(candidate, bad, space) : 0;
-        const score = logL - logG;
-        if(score > bestScore){ bestScore = score; bestCandidate = candidate; }
-      }
-
-      return bestCandidate;
-    }
-
-    // Box-Muller for Gaussian random
-    function _gaussRandom(){
-      let u=0,v=0;
-      while(u===0) u=rng();
-      while(v===0) v=rng();
-      return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
-    }
-
-    return { suggest, sampleUniform: _sampleUniform, N_STARTUP };
-  })();
-
-  // ══════════════════════════════════════════════════════════
-  // RIDGE — search space & TPE-based tuning
-  // ══════════════════════════════════════════════════════════
-
-  const RIDGE_SPACE = [
-    {name:'alpha', type:'logUniform', low:1e-4, high:1e7}
-  ];
-
-  // Tune Ridge with inner TSCV + TPE
-  function tuneRidgeCV(X, y, innerCfg, nTrials, kBest) {
-    const innerSplits = tscvSplits(X.length, innerCfg.nSplits);
-    if(!innerSplits.length) return {alpha:1.0};
-
-    const observations = []; // {params, loss}
-    let bestAlpha=1, bestMAE=Infinity;
-
-    for(let trial=0; trial<nTrials; trial++){
-      const params = TPE.suggest(RIDGE_SPACE, observations);
-      const alpha = params.alpha;
-
-      const foldMAEs=[];
-      for(const [trIdx,teIdx] of innerSplits){
-        const Xtr=trIdx.map(i=>X[i]), ytr=trIdx.map(i=>y[i]);
-        const Xte=teIdx.map(i=>X[i]), yte=teIdx.map(i=>y[i]);
-        const pp=preprocessFold(Xtr,Xte);
-        const sel=selectKBestMI(pp.Xtr_sc,ytr,kBest);
-        const Xtr_fs=sel.X, Xte_fs=pp.Xte_sc.map(r=>sel.idx.map(j=>r[j]));
-        try{
-          const w=ridgeFit(Xtr_fs,ytr,alpha);
-          const pred=ridgePredict(Xte_fs,w);
-          foldMAEs.push(maeScore(yte,pred));
-        }catch(e){}
-      }
-
-      if(foldMAEs.length){
-        const m=mean(foldMAEs);
-        observations.push({params, loss:m});
-        if(m<bestMAE){bestMAE=m;bestAlpha=alpha;}
-      } else {
-        observations.push({params, loss:1e9});
-      }
-    }
-    return {alpha:bestAlpha};
-  }
-
-  // Forecast Ridge on all data (final prediction)
-  function forecastRidgeNext(X, y, kBest) {
-    const X_imp=imputeMedian(X); const sc=standardize(X_imp);
-    const sel=selectKBestMI(sc.X,y,kBest);
-    const X_fs=sel.X;
-    // Get selected feature names from indices
-    const selectedIdx=sel.idx;
-    // We return w, the last row prediction, and selected indices
-    // Alpha is already tuned — we retrain with best alpha on ALL data
-    return {X_fs, selectedIdx};
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // XGBOOST-FAITHFUL GRADIENT BOOSTED TREES
-  // Gradient/Hessian-based splits, L1/L2 reg, gamma, min_child_weight
-  // Mirrors xgb.train() behavior from app.py
-  // ══════════════════════════════════════════════════════════
-
-  class XGBTree {
-    constructor(maxDepth, lambda, gamma, minChildWeight, colsampleBytree, growPolicy, maxLeaves) {
-      this.maxDepth=maxDepth; this.lambda=lambda; this.gamma=gamma;
-      this.minChildWeight=minChildWeight; this.colsample=colsampleBytree;
-      this.growPolicy=growPolicy||'depthwise'; // 'depthwise' or 'leafwise'
-      this.maxLeaves=maxLeaves||0; // 0 = unlimited (controlled by maxDepth)
-      this.root=null;
-    }
-
-    fit(gradients, hessians, X) {
-      if(this.growPolicy==='leafwise'){
-        this.root = this._buildLeafWise(gradients, hessians, X);
-      } else {
-        this.root = this._buildDepthWise(gradients, hessians, X, 0);
-      }
-    }
-
-    predict(X) { return X.map(r => this._pred(r, this.root)); }
-
-    _pred(row, node) {
-      if(node.leaf) return node.weight;
-      return row[node.f] <= node.t ? this._pred(row, node.left) : this._pred(row, node.right);
-    }
-
-    _leafWeight(G, H) {
-      return -G / (H + this.lambda);
-    }
-
-    // ── Find best split for a set of gradients/hessians/features ──
-    _findBestSplit(grads, hess, X, G, H) {
-      const n = grads.length;
-      const p = X[0].length;
-      const nFeat = Math.max(1, Math.floor(p * this.colsample));
-      const allFeats = Array.from({length:p},(_,i)=>i);
-      for(let i=p-1;i>0;i--){const j=Math.floor(rng()*(i+1));[allFeats[i],allFeats[j]]=[allFeats[j],allFeats[i]];}
-      const featIdx = allFeats.slice(0, nFeat);
-
-      let bestGain = 0, bestF=-1, bestT=0;
-
-      for(const f of featIdx){
-        const sortedIdx = Array.from({length:n},(_,i)=>i).sort((a,b)=>X[a][f]-X[b][f]);
-        let GL=0, HL=0;
-        for(let si=0; si<n-1; si++){
-          const i = sortedIdx[si];
-          GL += grads[i]; HL += hess[i];
-          const GR = G-GL, HR = H-HL;
-          if(X[sortedIdx[si]][f] === X[sortedIdx[si+1]][f]) continue;
-          if(HL < this.minChildWeight || HR < this.minChildWeight) continue;
-          const gain = 0.5*(GL*GL/(HL+this.lambda) + GR*GR/(HR+this.lambda) - G*G/(H+this.lambda)) - this.gamma;
-          if(gain > bestGain){ bestGain=gain; bestF=f; bestT=(X[sortedIdx[si]][f]+X[sortedIdx[si+1]][f])/2; }
-        }
-      }
-      return {gain:bestGain, f:bestF, t:bestT};
-    }
-
-    // ── Depth-wise growth (original XGBoost behavior) ──
-    _buildDepthWise(grads, hess, X, depth) {
-      const n = grads.length;
-      let G=0, H=0;
-      for(let i=0;i<n;i++){G+=grads[i]; H+=hess[i];}
-      const weight = this._leafWeight(G, H);
-
-      if(depth >= this.maxDepth || H < this.minChildWeight*2 || n < 4)
-        return {leaf:true, weight};
-
-      const split = this._findBestSplit(grads, hess, X, G, H);
-      if(split.f === -1) return {leaf:true, weight};
-
-      const lGrads=[],lHess=[],lX=[], rGrads=[],rHess=[],rX=[];
-      for(let i=0;i<n;i++){
-        if(X[i][split.f]<=split.t){lGrads.push(grads[i]);lHess.push(hess[i]);lX.push(X[i]);}
-        else{rGrads.push(grads[i]);rHess.push(hess[i]);rX.push(X[i]);}
-      }
-
-      return {
-        leaf:false, f:split.f, t:split.t,
-        left: this._buildDepthWise(lGrads,lHess,lX,depth+1),
-        right: this._buildDepthWise(rGrads,rHess,rX,depth+1)
-      };
-    }
-
-    // ── Leaf-wise growth (LightGBM-style: best-first / highest-gain leaf) ──
-    _buildLeafWise(grads, hess, X) {
-      const n = grads.length;
-      let G=0, H=0;
-      for(let i=0;i<n;i++){G+=grads[i]; H+=hess[i];}
-
-      const maxLv = this.maxLeaves > 0 ? this.maxLeaves : 31; // default cap
-      const depthCap = this.maxDepth || 64; // safety limit to prevent degenerate trees
-
-      // Root node starts as a leaf
-      const root = {leaf:true, weight:this._leafWeight(G, H), _grads:grads, _hess:hess, _X:X, _G:G, _H:H, _depth:0};
-
-      // Priority queue of splittable leaf candidates (sorted by best gain)
-      // Each entry: {node, gain, f, t}
-      const candidates = [];
-
-      // Evaluate root for splitting
-      if(n >= 4 && H >= this.minChildWeight*2){
-        const s = this._findBestSplit(grads, hess, X, G, H);
-        if(s.f !== -1) candidates.push({node:root, gain:s.gain, f:s.f, t:s.t});
-      }
-
-      let nLeaves = 1;
-
-      while(candidates.length > 0 && nLeaves < maxLv){
-        // Pop the candidate with the highest gain
-        let bestIdx=0;
-        for(let i=1;i<candidates.length;i++){
-          if(candidates[i].gain > candidates[bestIdx].gain) bestIdx=i;
-        }
-        const best = candidates[bestIdx];
-        candidates.splice(bestIdx, 1);
-
-        const nd = best.node;
-        if(nd._depth >= depthCap) continue; // safety: skip if too deep
-
-        // Partition data
-        const lGrads=[],lHess=[],lX=[], rGrads=[],rHess=[],rX=[];
-        let GL=0,HL=0,GR=0,HR=0;
-        for(let i=0;i<nd._grads.length;i++){
-          if(nd._X[i][best.f]<=best.t){
-            lGrads.push(nd._grads[i]);lHess.push(nd._hess[i]);lX.push(nd._X[i]);
-            GL+=nd._grads[i]; HL+=nd._hess[i];
-          } else {
-            rGrads.push(nd._grads[i]);rHess.push(nd._hess[i]);rX.push(nd._X[i]);
-            GR+=nd._grads[i]; HR+=nd._hess[i];
-          }
-        }
-
-        // Create child leaves
-        const childDepth = nd._depth + 1;
-        const leftNode  = {leaf:true, weight:this._leafWeight(GL,HL), _grads:lGrads, _hess:lHess, _X:lX, _G:GL, _H:HL, _depth:childDepth};
-        const rightNode = {leaf:true, weight:this._leafWeight(GR,HR), _grads:rGrads, _hess:rHess, _X:rX, _G:GR, _H:HR, _depth:childDepth};
-
-        // Convert parent from leaf to internal node
-        nd.leaf=false; nd.f=best.f; nd.t=best.t;
-        nd.left=leftNode; nd.right=rightNode;
-        nLeaves++; // was 1 leaf, now 2 → net +1
-
-        // Evaluate children as split candidates
-        for(const child of [leftNode, rightNode]){
-          if(child._grads.length >= 4 && child._H >= this.minChildWeight*2 && child._depth < depthCap){
-            const s = this._findBestSplit(child._grads, child._hess, child._X, child._G, child._H);
-            if(s.f !== -1) candidates.push({node:child, gain:s.gain, f:s.f, t:s.t});
-          }
-        }
-      }
-
-      // Clean up internal data arrays to free memory
-      this._cleanTree(root);
-      return root;
-    }
-
-    _cleanTree(node) {
-      delete node._grads; delete node._hess; delete node._X;
-      delete node._G; delete node._H; delete node._depth;
-      if(!node.leaf){
-        this._cleanTree(node.left);
-        this._cleanTree(node.right);
-      }
-    }
-  }
-
-  // Full XGBoost model — mirrors xgb.train() with early stopping
-  class XGBModel {
-    constructor(params) {
-      this.nRounds      = params.nRounds || 1000;
-      this.eta          = params.eta || 0.05;
-      this.maxDepth     = params.maxDepth || 4;
-      this.lambda       = params.lambda || 1.0;   // L2 regularization
-      this.alpha        = params.alpha || 0.0;     // L1 regularization
-      this.gamma        = params.gamma || 0;       // min split gain
-      this.subsample    = params.subsample || 0.8;
-      this.colsample    = params.colsample || 0.8;
-      this.minChildWeight = params.minChildWeight || 3.0;
-      this.earlyStopRounds = params.earlyStopRounds || 40;
-      this.growPolicy   = params.growPolicy || 'depthwise'; // 'depthwise' or 'leafwise'
-      this.maxLeaves    = params.maxLeaves || 0;            // 0 = use maxDepth limit
-      this.trees=[]; this.base=0; this.bestNTrees=0;
-    }
-
-    train(Xtr, ytr, Xval, yval) {
-      const n=ytr.length;
-      this.base = mean(ytr);
-      const predsTr = new Float64Array(n).fill(this.base);
-      const predsVal = Xval ? new Float64Array(yval.length).fill(this.base) : null;
-      let bestValMAE=Infinity, bestRound=0;
-      this.trees=[];
-
-      for(let round=0; round<this.nRounds; round++){
-        // Gradients & Hessians for squared error: L = 0.5*(pred-y)²
-        // gradient = pred - y, hessian = 1
-        const gradients = new Float64Array(n);
-        const hessians = new Float64Array(n).fill(1.0);
-        for(let i=0;i<n;i++){
-          let g = predsTr[i] - ytr[i];
-          // L1 regularization on gradients (proximal approach)
-          if(this.alpha > 0){
-            if(g > this.alpha) g -= this.alpha;
-            else if(g < -this.alpha) g += this.alpha;
-            else g = 0;
-          }
-          gradients[i] = g;
-        }
-
-        // Subsample rows
-        let sIdx;
-        if(this.subsample < 1){
-          sIdx=[];for(let i=0;i<n;i++) if(rng()<this.subsample) sIdx.push(i);
-          if(sIdx.length<5) sIdx=Array.from({length:n},(_,i)=>i);
-        } else sIdx=Array.from({length:n},(_,i)=>i);
-
-        const tree = new XGBTree(this.maxDepth, this.lambda, this.gamma, this.minChildWeight, this.colsample, this.growPolicy, this.maxLeaves);
-        tree.fit(
-          sIdx.map(i=>gradients[i]),
-          sIdx.map(i=>hessians[i]),
-          sIdx.map(i=>Xtr[i])
-        );
-        this.trees.push(tree);
-
-        // Update train predictions
-        const tPredTr = tree.predict(Xtr);
-        for(let i=0;i<n;i++) predsTr[i] += this.eta * tPredTr[i];
-
-        // Early stopping on validation
-        if(Xval && yval){
-          const tPredVal = tree.predict(Xval);
-          for(let i=0;i<yval.length;i++) predsVal[i] += this.eta * tPredVal[i];
-          const valMAE = maeScore(yval, Array.from(predsVal));
-          if(valMAE < bestValMAE){bestValMAE=valMAE; bestRound=round;}
-          else if(round - bestRound >= this.earlyStopRounds){
-            // Restore best model
-            this.trees = this.trees.slice(0, bestRound+1);
-            this.bestNTrees = bestRound+1;
-            return;
-          }
-        }
-      }
-      this.bestNTrees = this.trees.length;
-    }
-
-    predict(X){
-      const preds = new Float64Array(X.length).fill(this.base);
-      for(const tree of this.trees){
-        const tp=tree.predict(X);
-        for(let i=0;i<X.length;i++) preds[i] += this.eta * tp[i];
-      }
-      return Array.from(preds);
-    }
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // RANDOM FOREST — Bagging of CART regression trees
-  // Variance-reduction splits (MSE), bootstrap + feature subsampling
-  // Complementary to XGBoost: averaging reduces variance vs boosting
-  // ══════════════════════════════════════════════════════════
-
-  class CARTTree {
-    constructor(maxDepth, minSamplesLeaf, maxFeatures) {
-      this.maxDepth = maxDepth || 8;
-      this.minSamplesLeaf = minSamplesLeaf || 5;
-      this.maxFeatures = maxFeatures || 0.7; // fraction of features per split
-      this.root = null;
-    }
-
-    fit(X, y) { this.root = this._build(X, y, 0); }
-
-    predict(X) { return X.map(r => this._traverse(r, this.root)); }
-
-    _traverse(row, node) {
-      if(!node.left) return node.val;
-      return row[node.f] <= node.t ? this._traverse(row, node.left) : this._traverse(row, node.right);
-    }
-
-    _build(X, y, depth) {
-      const n = y.length;
-      const mu = mean(y);
-      if(depth >= this.maxDepth || n < this.minSamplesLeaf * 2)
-        return {val: mu, left: null, right: null};
-
-      const p = X[0].length;
-      const nFeat = Math.max(1, Math.round(p * this.maxFeatures));
-      const allF = Array.from({length:p}, (_,i) => i);
-      for(let i=p-1;i>0;i--){const j=Math.floor(rng()*(i+1));[allF[i],allF[j]]=[allF[j],allF[i]];}
-      const feats = allF.slice(0, nFeat);
-
-      const totalSS = y.reduce((s,v) => s + (v - mu) ** 2, 0);
-      let bestGain = 0, bestF = -1, bestT = 0;
-
-      for(const f of feats) {
-        const sortedIdx = Array.from({length:n}, (_,i) => i).sort((a,b) => X[a][f] - X[b][f]);
-        let lSum = 0, lSqSum = 0, lN = 0;
-        let rSum = y.reduce((s,v) => s + v, 0);
-        let rSqSum = y.reduce((s,v) => s + v * v, 0);
-        let rN = n;
-
-        for(let si = 0; si < n - 1; si++) {
-          const i = sortedIdx[si];
-          lSum += y[i]; lSqSum += y[i] ** 2; lN++;
-          rSum -= y[i]; rSqSum -= y[i] ** 2; rN--;
-          if(lN < this.minSamplesLeaf || rN < this.minSamplesLeaf) continue;
-          if(X[sortedIdx[si]][f] === X[sortedIdx[si+1]][f]) continue;
-          const lVar = lSqSum - lSum ** 2 / lN;
-          const rVar = rSqSum - rSum ** 2 / rN;
-          const gain = totalSS - lVar - rVar;
-          if(gain > bestGain){
-            bestGain = gain; bestF = f;
-            bestT = (X[sortedIdx[si]][f] + X[sortedIdx[si+1]][f]) / 2;
-          }
-        }
-      }
-
-      if(bestF === -1) return {val: mu, left: null, right: null};
-
-      const lX=[], ly=[], rX=[], ry=[];
-      for(let i=0;i<n;i++){
-        if(X[i][bestF] <= bestT){ lX.push(X[i]); ly.push(y[i]); }
-        else { rX.push(X[i]); ry.push(y[i]); }
-      }
-      return {
-        val: mu, f: bestF, t: bestT,
-        left: this._build(lX, ly, depth + 1),
-        right: this._build(rX, ry, depth + 1)
-      };
-    }
-  }
-
-  class RandomForestModel {
-    constructor(params) {
-      this.nTrees = params.nTrees || 50;
-      this.maxDepth = params.maxDepth || 8;
-      this.minSamplesLeaf = params.minSamplesLeaf || 5;
-      this.maxFeatures = params.maxFeatures || 0.7;
-      this.trees = [];
-    }
-
-    train(X, y) {
-      const n = X.length;
-      this.trees = [];
-      for(let t = 0; t < this.nTrees; t++) {
-        // Bootstrap sample (sampling with replacement)
-        const idx = Array.from({length:n}, () => Math.floor(rng() * n));
-        const Xb = idx.map(i => X[i]);
-        const yb = idx.map(i => y[i]);
-        const tree = new CARTTree(this.maxDepth, this.minSamplesLeaf, this.maxFeatures);
-        tree.fit(Xb, yb);
-        this.trees.push(tree);
-      }
-    }
-
-    predict(X) {
-      const allPreds = this.trees.map(t => t.predict(X));
-      return X.map((_, i) => {
-        let s = 0;
-        for(const p of allPreds) s += p[i];
-        return s / this.trees.length;
-      });
-    }
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // MLP — Multi-Layer Perceptron with Adam optimizer
-  // 2 hidden layers, ReLU, He initialization, L2 reg, early stopping
-  // Captures non-linearities different from tree-based models
-  // ══════════════════════════════════════════════════════════
-
-  class MLPModel {
-    constructor(params) {
-      this.hiddenSizes = params.hiddenSizes || [32, 16];
-      this.lr = params.lr || 0.001;
-      this.epochs = params.epochs || 200;
-      this.batchSize = params.batchSize || 32;
-      this.l2 = params.l2 || 0.001;
-      this.earlyStopPatience = params.earlyStopPatience || 20;
-      this.weights = []; this.biases = [];
-      this.mW = []; this.vW = []; this.mB = []; this.vB = [];
-    }
-
-    _initWeights(inputDim) {
-      const sizes = [inputDim, ...this.hiddenSizes, 1];
-      this.weights = []; this.biases = [];
-      this.mW = []; this.vW = []; this.mB = []; this.vB = [];
-      for(let l = 0; l < sizes.length - 1; l++) {
-        const fanIn = sizes[l], fanOut = sizes[l+1];
-        const scale = Math.sqrt(2.0 / fanIn); // He initialization
-        this.weights.push(Array.from({length:fanIn}, () =>
-          Array.from({length:fanOut}, () => (rng()*2-1) * scale)));
-        this.biases.push(new Array(fanOut).fill(0));
-        // Adam moments
-        this.mW.push(Array.from({length:fanIn}, () => new Array(fanOut).fill(0)));
-        this.vW.push(Array.from({length:fanIn}, () => new Array(fanOut).fill(0)));
-        this.mB.push(new Array(fanOut).fill(0));
-        this.vB.push(new Array(fanOut).fill(0));
-      }
-    }
-
-    _forward(x) {
-      const acts = [x];
-      let a = x;
-      for(let l = 0; l < this.weights.length; l++) {
-        const W = this.weights[l], b = this.biases[l];
-        const nOut = W[0].length;
-        const z = new Array(nOut);
-        for(let j = 0; j < nOut; j++) {
-          let s = b[j];
-          for(let i = 0; i < a.length; i++) s += a[i] * W[i][j];
-          z[j] = s;
-        }
-        // ReLU for hidden layers, linear for output
-        a = (l < this.weights.length - 1) ? z.map(v => Math.max(0, v)) : z;
-        acts.push(a);
-      }
-      return acts;
-    }
-
-    _backward(acts, target) {
-      const L = this.weights.length;
-      const dW = [], dB = [];
-      let delta = [acts[L][0] - target];
-
-      for(let l = L - 1; l >= 0; l--) {
-        const aPrev = acts[l];
-        const W = this.weights[l];
-        const nIn = W.length, nOut = W[0].length;
-
-        const gW = Array.from({length:nIn}, () => new Array(nOut));
-        const gB = new Array(nOut);
-        for(let j = 0; j < nOut; j++) {
-          gB[j] = delta[j];
-          for(let i = 0; i < nIn; i++) gW[i][j] = aPrev[i] * delta[j];
-        }
-        dW.unshift(gW);
-        dB.unshift(gB);
-
-        if(l > 0) {
-          const nd = new Array(nIn).fill(0);
-          for(let i = 0; i < nIn; i++) {
-            for(let j = 0; j < nOut; j++) nd[i] += W[i][j] * delta[j];
-            if(acts[l][i] <= 0) nd[i] = 0; // ReLU derivative
-          }
-          delta = nd;
-        }
-      }
-      return {dW, dB};
-    }
-
-    _adamStep(dW, dB, t) {
-      const b1=0.9, b2=0.999, eps=1e-8;
-      for(let l = 0; l < this.weights.length; l++) {
-        const nIn = this.weights[l].length, nOut = this.weights[l][0].length;
-        for(let i = 0; i < nIn; i++) for(let j = 0; j < nOut; j++) {
-          const g = dW[l][i][j] + this.l2 * this.weights[l][i][j];
-          this.mW[l][i][j] = b1*this.mW[l][i][j] + (1-b1)*g;
-          this.vW[l][i][j] = b2*this.vW[l][i][j] + (1-b2)*g*g;
-          const mH = this.mW[l][i][j] / (1 - Math.pow(b1,t));
-          const vH = this.vW[l][i][j] / (1 - Math.pow(b2,t));
-          this.weights[l][i][j] -= this.lr * mH / (Math.sqrt(vH) + eps);
-        }
-        for(let j = 0; j < nOut; j++) {
-          this.mB[l][j] = b1*this.mB[l][j] + (1-b1)*dB[l][j];
-          this.vB[l][j] = b2*this.vB[l][j] + (1-b2)*dB[l][j]**2;
-          const mH = this.mB[l][j] / (1 - Math.pow(b1,t));
-          const vH = this.vB[l][j] / (1 - Math.pow(b2,t));
-          this.biases[l][j] -= this.lr * mH / (Math.sqrt(vH) + eps);
-        }
-      }
-    }
-
-    _cloneState() {
-      return {
-        w: this.weights.map(W => W.map(r => [...r])),
-        b: this.biases.map(b => [...b])
-      };
-    }
-    _restoreState(st) { this.weights = st.w; this.biases = st.b; }
-
-    train(Xtr, ytr, Xval, yval) {
-      this._initWeights(Xtr[0].length);
-      const n = Xtr.length;
-      let bestValMAE = Infinity, patience = 0, bestState = null, step = 0;
-      this.bestEpochs = this.epochs; // track optimal stopping point
-
-      for(let epoch = 0; epoch < this.epochs; epoch++) {
-        // Shuffle indices
-        const idx = Array.from({length:n}, (_,i) => i);
-        for(let i=n-1;i>0;i--){const j=Math.floor(rng()*(i+1));[idx[i],idx[j]]=[idx[j],idx[i]];}
-
-        // Mini-batch SGD with Adam
-        for(let bStart = 0; bStart < n; bStart += this.batchSize) {
-          const bEnd = Math.min(bStart + this.batchSize, n);
-          const bSz = bEnd - bStart;
-          const accDW = this.weights.map(W => W.map(r => r.map(() => 0)));
-          const accDB = this.biases.map(b => b.map(() => 0));
-
-          for(let bi = bStart; bi < bEnd; bi++) {
-            const acts = this._forward(Xtr[idx[bi]]);
-            const {dW, dB} = this._backward(acts, ytr[idx[bi]]);
-            for(let l = 0; l < dW.length; l++) {
-              for(let ii = 0; ii < dW[l].length; ii++)
-                for(let jj = 0; jj < dW[l][ii].length; jj++)
-                  accDW[l][ii][jj] += dW[l][ii][jj] / bSz;
-              for(let jj = 0; jj < dB[l].length; jj++)
-                accDB[l][jj] += dB[l][jj] / bSz;
-            }
-          }
-          step++;
-          this._adamStep(accDW, accDB, step);
-        }
-
-        // Early stopping on validation
-        if(Xval && yval) {
-          const pred = this.predict(Xval);
-          const vMAE = maeScore(yval, pred);
-          if(vMAE < bestValMAE) {
-            bestValMAE = vMAE; patience = 0;
-            bestState = this._cloneState();
-            this.bestEpochs = epoch + 1;
-          } else {
-            patience++;
-            if(patience >= this.earlyStopPatience) {
-              if(bestState) this._restoreState(bestState);
-              return;
-            }
-          }
-        }
-      }
-      if(bestState) this._restoreState(bestState);
-    }
-
-    predict(X) {
-      return X.map(x => {
-        const acts = this._forward(x);
-        return acts[acts.length - 1][0];
-      });
-    }
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // XGB — search space & TPE-based tuning
-  // ══════════════════════════════════════════════════════════
-
-  const XGB_SPACE = [
-    {name:'eta',            type:'categorical', values:[0.01, 0.03, 0.05, 0.08]},
-    {name:'subsample',      type:'categorical', values:[0.7, 0.8, 0.9, 1.0]},
-    {name:'colsample',      type:'categorical', values:[0.7, 0.8, 0.9, 1.0]},
-    {name:'minChildWeight', type:'categorical', values:[1.0, 3.0, 5.0, 7.0]},
-    {name:'lambda',         type:'categorical', values:[0.5, 1.0, 2.0, 5.0]},
-    {name:'alpha',          type:'categorical', values:[0.0, 0.1, 0.5]},
-    {name:'growPolicy',     type:'categorical', values:['depthwise','depthwise','leafwise']},
-    {name:'maxDepth',       type:'categorical', values:[3,4,5,6,7,8,10,12]},
-    {name:'maxLeaves',      type:'categorical', values:[0,15,31,63,127]},
-  ];
-
-  // Post-process XGB params for grow-policy consistency
-  function _fixXGBParams(p){
-    const out = {...p};
-    if(out.growPolicy==='leafwise'){
-      if(out.maxLeaves===0) out.maxLeaves=31;
-      if(out.maxDepth<6) out.maxDepth=Math.max(out.maxDepth,8);
-    } else {
-      out.maxLeaves=0;
-      if(out.maxDepth>7) out.maxDepth=7;
-    }
-    return out;
-  }
-
-  // Generate random XGB param sets (for warm-up / fallback)
-  function sampleXGBParams(nTrials) {
-    const out = [];
-    for(let i=0;i<nTrials;i++){
-      const p = {};
-      for(const entry of XGB_SPACE) p[entry.name] = TPE.sampleUniform(entry);
-      out.push(_fixXGBParams(p));
-    }
-    return out;
-  }
-
-  // Tune XGB with inner TSCV + TPE (Bayesian optimization)
-  function tuneXGBCV(X, y, innerCfg, nTrials, kBest) {
-    const innerSplits = tscvSplits(X.length, innerCfg.nSplits);
-    if(!innerSplits.length) return sampleXGBParams(1)[0];
-
-    const observations = []; // {params, loss}
-    let bestParams=null, bestMAE=Infinity;
-
-    for(let trial=0; trial<nTrials; trial++){
-      // TPE suggests next candidate (random during warm-up, then Bayesian)
-      const raw = TPE.suggest(XGB_SPACE, observations);
-      const p = _fixXGBParams(raw);
-
-      const foldMAEs = [];
-      for(const [trIdx, teIdx] of innerSplits){
-        const Xtr=trIdx.map(i=>X[i]), ytr=trIdx.map(i=>y[i]);
-        const Xte=teIdx.map(i=>X[i]), yte=teIdx.map(i=>y[i]);
-
-        const pp = preprocessFold(Xtr, Xte);
-        const sel = selectKBestMI(pp.Xtr_sc, ytr, kBest);
-        const Xtr_fs = sel.X, Xte_fs = pp.Xte_sc.map(r=>sel.idx.map(j=>r[j]));
-
-        const minTrain=20, minVal=8;
-        if(Xtr_fs.length < minTrain+minVal) continue;
-
-        const cut = clip(Math.floor(0.8*Xtr_fs.length), minTrain, Xtr_fs.length-minVal);
-        const Xtr_in=Xtr_fs.slice(0,cut), ytr_in=ytr.slice(0,cut);
-        const Xva_in=Xtr_fs.slice(cut), yva_in=ytr.slice(cut);
-
-        try{
-          const model = new XGBModel({
-            ...p,
-            nRounds: innerCfg.xgbNumBoostRound,
-            earlyStopRounds: innerCfg.xgbEarlyStopRounds
-          });
-          model.train(Xtr_in, ytr_in, Xva_in, yva_in);
-          const pred = model.predict(Xte_fs);
-          foldMAEs.push(maeScore(yte, pred));
-        }catch(e){}
-      }
-
-      if(foldMAEs.length){
-        const m=mean(foldMAEs);
-        observations.push({params:p, loss:m});
-        if(m<bestMAE){bestMAE=m;bestParams={...p};}
-      } else {
-        observations.push({params:p, loss:1e9});
-      }
-    }
-    return bestParams || sampleXGBParams(1)[0];
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // RANDOM FOREST — search space & TPE-based tuning
-  // ══════════════════════════════════════════════════════════
-
-  const RF_SPACE = [
-    {name:'nTrees',         type:'categorical', values:[30, 50, 80]},
-    {name:'maxDepth',       type:'categorical', values:[4, 6, 8, 12]},
-    {name:'minSamplesLeaf', type:'categorical', values:[3, 5, 8, 12]},
-    {name:'maxFeatures',    type:'categorical', values:[0.5, 0.7, 0.85, 1.0]},
-  ];
-
-  function sampleRFParams(nTrials) {
-    const out = [];
-    for(let i=0;i<nTrials;i++){
-      const p = {};
-      for(const entry of RF_SPACE) p[entry.name] = TPE.sampleUniform(entry);
-      out.push(p);
-    }
-    return out;
-  }
-
-  function tuneRFCV(X, y, innerCfg, nTrials, kBest) {
-    const innerSplits = tscvSplits(X.length, innerCfg.nSplits);
-    if(!innerSplits.length) return sampleRFParams(1)[0];
-
-    const observations = [];
-    let bestParams=null, bestMAE=Infinity;
-
-    for(let trial=0; trial<nTrials; trial++){
-      const p = TPE.suggest(RF_SPACE, observations);
-
-      const foldMAEs = [];
-      for(const [trIdx, teIdx] of innerSplits){
-        const Xtr=trIdx.map(i=>X[i]), ytr=trIdx.map(i=>y[i]);
-        const Xte=teIdx.map(i=>X[i]), yte=teIdx.map(i=>y[i]);
-
-        const pp = preprocessFold(Xtr, Xte);
-        const sel = selectKBestMI(pp.Xtr_sc, ytr, kBest);
-        const Xtr_fs = sel.X, Xte_fs = pp.Xte_sc.map(r=>sel.idx.map(j=>r[j]));
-
-        try{
-          const model = new RandomForestModel(p);
-          model.train(Xtr_fs, ytr);
-          const pred = model.predict(Xte_fs);
-          foldMAEs.push(maeScore(yte, pred));
-        }catch(e){}
-      }
-
-      if(foldMAEs.length){
-        const m=mean(foldMAEs);
-        observations.push({params:p, loss:m});
-        if(m<bestMAE){bestMAE=m;bestParams={...p};}
-      } else {
-        observations.push({params:p, loss:1e9});
-      }
-    }
-    return bestParams || sampleRFParams(1)[0];
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // MLP — search space & TPE-based tuning
-  // ══════════════════════════════════════════════════════════
-
-  const MLP_SPACE = [
-    {name:'hiddenSize1', type:'categorical', values:[16, 32, 48, 64]},
-    {name:'hiddenSize2', type:'categorical', values:[8, 16, 24, 32]},
-    {name:'lr',          type:'categorical', values:[0.0005, 0.001, 0.003, 0.005]},
-    {name:'l2',          type:'categorical', values:[0.0001, 0.001, 0.005, 0.01]},
-    {name:'batchSize',   type:'categorical', values:[16, 32, 64]},
-    {name:'epochs',      type:'categorical', values:[100, 150, 200, 300]},
-  ];
-
-  function sampleMLPParams(nTrials) {
-    const out = [];
-    for(let i=0;i<nTrials;i++){
-      const p = {};
-      for(const entry of MLP_SPACE) p[entry.name] = TPE.sampleUniform(entry);
-      out.push(p);
-    }
-    return out;
-  }
-
-  function _toMLPParams(p) {
-    return {
-      hiddenSizes: [p.hiddenSize1, p.hiddenSize2],
-      lr: p.lr, l2: p.l2, batchSize: p.batchSize,
-      epochs: p.epochs || 150, earlyStopPatience: 15
-    };
-  }
-
-  function tuneMLPCV(X, y, innerCfg, nTrials, kBest) {
-    const innerSplits = tscvSplits(X.length, innerCfg.nSplits);
-    if(!innerSplits.length) return sampleMLPParams(1)[0];
-
-    const observations = [];
-    let bestParams=null, bestMAE=Infinity;
-
-    for(let trial=0; trial<nTrials; trial++){
-      const raw = TPE.suggest(MLP_SPACE, observations);
-      const p = _toMLPParams(raw);
-
-      const foldMAEs = [];
-      for(const [trIdx, teIdx] of innerSplits){
-        const Xtr=trIdx.map(i=>X[i]), ytr=trIdx.map(i=>y[i]);
-        const Xte=teIdx.map(i=>X[i]), yte=teIdx.map(i=>y[i]);
-
-        const pp = preprocessFold(Xtr, Xte);
-        const sel = selectKBestMI(pp.Xtr_sc, ytr, kBest);
-        const Xtr_fs = sel.X, Xte_fs = pp.Xte_sc.map(r=>sel.idx.map(j=>r[j]));
-
-        // Train/val split within the training fold for early stopping
-        const minTrain=20, minVal=8;
-        if(Xtr_fs.length < minTrain+minVal) continue;
-        const cut = clip(Math.floor(0.8*Xtr_fs.length), minTrain, Xtr_fs.length-minVal);
-
-        try{
-          const model = new MLPModel(p);
-          model.train(Xtr_fs.slice(0,cut), ytr.slice(0,cut), Xtr_fs.slice(cut), ytr.slice(cut));
-          const pred = model.predict(Xte_fs);
-          foldMAEs.push(maeScore(yte, pred));
-        }catch(e){}
-      }
-
-      if(foldMAEs.length){
-        const m=mean(foldMAEs);
-        observations.push({params:raw, loss:m});
-        if(m<bestMAE){bestMAE=m;bestParams={...raw};}
-      } else {
-        observations.push({params:raw, loss:1e9});
-      }
-    }
-    return bestParams || sampleMLPParams(1)[0];
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // NESTED EVALUATION — common outer splits, inner tuning
-  // No data leakage: outer test NEVER seen during tuning
-  // ══════════════════════════════════════════════════════════
-
-  function makeInnerCfg(cfg) {
-    return {
-      nSplits:            Math.max(2, cfg.nSplits - 1),
-      ridgeTrials:        cfg.ridgeTrials,
-      xgbTrials:          cfg.xgbTrials,
-      rfTrials:           cfg.rfTrials || 6,
-      mlpTrials:          cfg.mlpTrials || 6,
-      xgbNumBoostRound:   cfg.xgbNumBoostRound,
-      xgbEarlyStopRounds: cfg.xgbEarlyStopRounds,
-    };
-  }
-
-  function nestedEvalRidge(X, y, cfg, kBest, outerSplits) {
-    const innerCfg = makeInnerCfg(cfg);
-    const maes=[], rmses=[];
-
-    for(const [trIdx, teIdx] of outerSplits){
-      const Xtr=trIdx.map(i=>X[i]), ytr=trIdx.map(i=>y[i]);
-      const Xte=teIdx.map(i=>X[i]), yte=teIdx.map(i=>y[i]);
-
-      // Inner tuning on train fold only (NO test data leakage)
-      const bestParams = tuneRidgeCV(Xtr, ytr, innerCfg, innerCfg.ridgeTrials, kBest);
-
-      // Refit on full train fold, evaluate on test fold
-      const pp = preprocessFold(Xtr, Xte);
-      const sel = selectKBestMI(pp.Xtr_sc, ytr, kBest);
-      const Xtr_fs = sel.X, Xte_fs = pp.Xte_sc.map(r=>sel.idx.map(j=>r[j]));
-
-      try{
-        const w = ridgeFit(Xtr_fs, ytr, bestParams.alpha);
-        const pred = ridgePredict(Xte_fs, w);
-        maes.push(maeScore(yte, pred));
-        rmses.push(rmseScore(yte, pred));
-      }catch(e){}
-    }
-
-    return {
-      mae: maes.length ? mean(maes) : Infinity,
-      rmse: rmses.length ? mean(rmses) : Infinity
-    };
-  }
-
-  function nestedEvalXGB(X, y, cfg, kBest, outerSplits) {
-    const innerCfg = makeInnerCfg(cfg);
-    const maes=[], rmses=[];
-
-    for(const [trIdx, teIdx] of outerSplits){
-      const Xtr=trIdx.map(i=>X[i]), ytr=trIdx.map(i=>y[i]);
-      const Xte=teIdx.map(i=>X[i]), yte=teIdx.map(i=>y[i]);
-
-      // Inner tuning on train fold only (NO test data leakage)
-      const bestParams = tuneXGBCV(Xtr, ytr, innerCfg, innerCfg.xgbTrials, kBest);
-
-      // Refit on full train fold, evaluate on test fold
-      const pp = preprocessFold(Xtr, Xte);
-      const sel = selectKBestMI(pp.Xtr_sc, ytr, kBest);
-      const Xtr_fs = sel.X, Xte_fs = pp.Xte_sc.map(r=>sel.idx.map(j=>r[j]));
-
-      // Step 1: early-stop on a split to find optimal number of rounds
-      const minTr=15, minVa=5;
-      let bestNTrees = Math.min(100, cfg.xgbNumBoostRound); // safe default
-      if(Xtr_fs.length >= minTr+minVa) {
-        const cut = clip(Math.floor(0.8*Xtr_fs.length), minTr, Xtr_fs.length-minVa);
-        try{
-          const probe = new XGBModel({
-            ...bestParams,
-            nRounds: cfg.xgbNumBoostRound,
-            earlyStopRounds: cfg.xgbEarlyStopRounds
-          });
-          probe.train(Xtr_fs.slice(0,cut), ytr.slice(0,cut), Xtr_fs.slice(cut), ytr.slice(cut));
-          bestNTrees = probe.bestNTrees;
-        }catch(e){}
-      }
-
-      // Step 2: retrain on ALL fold data with fixed rounds (no holdout needed)
-      try{
-        const model = new XGBModel({
-          ...bestParams,
-          nRounds: bestNTrees,
-          earlyStopRounds: 9999 // effectively disabled
-        });
-        model.train(Xtr_fs, ytr, null, null);
-        const pred = model.predict(Xte_fs);
-        maes.push(maeScore(yte, pred));
-        rmses.push(rmseScore(yte, pred));
-      }catch(e){}
-    }
-
-    return {
-      mae: maes.length ? mean(maes) : Infinity,
-      rmse: rmses.length ? mean(rmses) : Infinity
-    };
-  }
-
-  function nestedEvalRF(X, y, cfg, kBest, outerSplits) {
-    const innerCfg = makeInnerCfg(cfg);
-    const maes=[], rmses=[];
-
-    for(const [trIdx, teIdx] of outerSplits){
-      const Xtr=trIdx.map(i=>X[i]), ytr=trIdx.map(i=>y[i]);
-      const Xte=teIdx.map(i=>X[i]), yte=teIdx.map(i=>y[i]);
-
-      const bestParams = tuneRFCV(Xtr, ytr, innerCfg, innerCfg.rfTrials, kBest);
-
-      const pp = preprocessFold(Xtr, Xte);
-      const sel = selectKBestMI(pp.Xtr_sc, ytr, kBest);
-      const Xtr_fs = sel.X, Xte_fs = pp.Xte_sc.map(r=>sel.idx.map(j=>r[j]));
-
-      try{
-        const model = new RandomForestModel(bestParams);
-        model.train(Xtr_fs, ytr);
-        const pred = model.predict(Xte_fs);
-        maes.push(maeScore(yte, pred));
-        rmses.push(rmseScore(yte, pred));
-      }catch(e){}
-    }
-
-    return {
-      mae: maes.length ? mean(maes) : Infinity,
-      rmse: rmses.length ? mean(rmses) : Infinity
-    };
-  }
-
-  function nestedEvalMLP(X, y, cfg, kBest, outerSplits) {
-    const innerCfg = makeInnerCfg(cfg);
-    const maes=[], rmses=[];
-
-    for(const [trIdx, teIdx] of outerSplits){
-      const Xtr=trIdx.map(i=>X[i]), ytr=trIdx.map(i=>y[i]);
-      const Xte=teIdx.map(i=>X[i]), yte=teIdx.map(i=>y[i]);
-
-      const bestRaw = tuneMLPCV(Xtr, ytr, innerCfg, innerCfg.mlpTrials, kBest);
-      const bestParams = _toMLPParams(bestRaw);
-
-      const pp = preprocessFold(Xtr, Xte);
-      const sel = selectKBestMI(pp.Xtr_sc, ytr, kBest);
-      const Xtr_fs = sel.X, Xte_fs = pp.Xte_sc.map(r=>sel.idx.map(j=>r[j]));
-
-      // Step 1: early-stop on a split to find optimal number of epochs
-      const minTr=12, minVa=5;
-      let bestEpochs = Math.min(50, bestParams.epochs); // safe default
-      if(Xtr_fs.length >= minTr+minVa) {
-        const cut = clip(Math.floor(0.8*Xtr_fs.length), minTr, Xtr_fs.length-minVa);
-        try{
-          const probe = new MLPModel(bestParams);
-          probe.train(Xtr_fs.slice(0,cut), ytr.slice(0,cut), Xtr_fs.slice(cut), ytr.slice(cut));
-          bestEpochs = probe.bestEpochs;
-        }catch(e){}
-      }
-
-      // Step 2: retrain on ALL fold data with fixed epochs (no holdout needed)
-      try{
-        const model = new MLPModel({...bestParams, epochs: bestEpochs, earlyStopPatience: 9999});
-        model.train(Xtr_fs, ytr, null, null);
-        const pred = model.predict(Xte_fs);
-        maes.push(maeScore(yte, pred));
-        rmses.push(rmseScore(yte, pred));
-      }catch(e){}
-    }
-
-    return {
-      mae: maes.length ? mean(maes) : Infinity,
-      rmse: rmses.length ? mean(rmses) : Infinity
-    };
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // FEATURE ENGINEERING (like app.py make_supervised)
-  // ══════════════════════════════════════════════════════════
-  function makeSupervised(kpiValues, featureMatrix, featureNames, horizon, lagCfg, kpiDates) {
-    const n=kpiValues.length; if(n<10) return null;
-    const featureLags=lagCfg.featureLags||[1,2,3];
-    const kpiLags=lagCfg.kpiLags||[1,2,3];
-    const rollingWindows=lagCfg.rollingWindows||[2,3];
-    const cols=[], colNames=[];
-
-    // -- Raw features + feature lags + rolling stats (mean, std, min, max) --
-    if(featureMatrix && featureMatrix.length===n){
-      const p=featureMatrix[0]?.length||0;
-      for(let j=0;j<p;j++){cols.push(featureMatrix.map(r=>r[j]));colNames.push(featureNames[j]||`f${j}`);}
-      for(let j=0;j<p;j++) for(const lag of featureLags){
-        const lagged=new Array(n).fill(NaN);
-        for(let i=lag;i<n;i++)lagged[i]=featureMatrix[i-lag][j];
-        cols.push(lagged);colNames.push(`${featureNames[j]||'f'+j}__lag${lag}`);
-      }
-      for(let j=0;j<p;j++) for(const w of rollingWindows){
-        const rm=new Array(n).fill(NaN), rs=new Array(n).fill(NaN);
-        const rmin=new Array(n).fill(NaN), rmax=new Array(n).fill(NaN);
-        for(let i=w;i<n;i++){
-          const sl=[];for(let k=i-w;k<i;k++)sl.push(featureMatrix[k][j]);
-          rm[i]=mean(sl);rs[i]=std(sl);
-          rmin[i]=Math.min(...sl);rmax[i]=Math.max(...sl);
-        }
-        cols.push(rm);colNames.push(`${featureNames[j]||'f'+j}__rm${w}`);
-        cols.push(rs);colNames.push(`${featureNames[j]||'f'+j}__rs${w}`);
-        cols.push(rmin);colNames.push(`${featureNames[j]||'f'+j}__rmin${w}`);
-        cols.push(rmax);colNames.push(`${featureNames[j]||'f'+j}__rmax${w}`);
-      }
-
-      // -- Feature deltas: period-over-period diff & % change --
-      // A feature stable at 100 for 3 years then jumping to 110 has near-zero
-      // raw variance, but its delta of +10 / +10% is a strong signal.
-      for(let j=0;j<p;j++){
-        const fname=featureNames[j]||'f'+j;
-        const fdiff=new Array(n).fill(NaN), fpct=new Array(n).fill(NaN);
-        for(let i=1;i<n;i++){
-          const prev=featureMatrix[i-1][j], cur=featureMatrix[i][j];
-          fdiff[i]=cur-prev;
-          fpct[i]=Math.abs(prev)>1e-9?(cur-prev)/Math.abs(prev):NaN;
-        }
-        cols.push(fdiff);colNames.push(`${fname}__delta`);
-        cols.push(fpct);colNames.push(`${fname}__pctchg`);
-      }
-
-      // -- Feature acceleration (diff of diff) for recent regime changes --
-      for(let j=0;j<p;j++){
-        const fname=featureNames[j]||'f'+j;
-        const facc=new Array(n).fill(NaN);
-        for(let i=2;i<n;i++){
-          const d1=featureMatrix[i][j]-featureMatrix[i-1][j];
-          const d0=featureMatrix[i-1][j]-featureMatrix[i-2][j];
-          facc[i]=d1-d0;
-        }
-        cols.push(facc);colNames.push(`${fname}__accel`);
-      }
-    }
-
-    // -- KPI lags --
-    for(const lag of kpiLags){
-      const lagged=new Array(n).fill(NaN);
-      for(let i=lag;i<n;i++)lagged[i]=kpiValues[i-lag];
-      cols.push(lagged);colNames.push(`kpi__lag${lag}`);
-    }
-
-    // -- KPI rolling stats (mean, std, min, max) --
-    for(const w of rollingWindows){
-      const rm=new Array(n).fill(NaN), rs=new Array(n).fill(NaN);
-      const rmin=new Array(n).fill(NaN), rmax=new Array(n).fill(NaN);
-      for(let i=w;i<n;i++){
-        const sl=[];for(let k=i-w;k<i;k++)sl.push(kpiValues[k]);
-        rm[i]=mean(sl);rs[i]=std(sl);
-        rmin[i]=Math.min(...sl);rmax[i]=Math.max(...sl);
-      }
-      cols.push(rm);colNames.push(`kpi__rm${w}`);
-      cols.push(rs);colNames.push(`kpi__rs${w}`);
-      cols.push(rmin);colNames.push(`kpi__rmin${w}`);
-      cols.push(rmax);colNames.push(`kpi__rmax${w}`);
-    }
-
-    // -- KPI differences (momentum & acceleration) --
-    const diff1=new Array(n).fill(NaN), diff2=new Array(n).fill(NaN);
-    for(let i=1;i<n;i++) diff1[i]=kpiValues[i]-kpiValues[i-1];
-    for(let i=2;i<n;i++) diff2[i]=diff1[i]-diff1[i-1];
-    cols.push(diff1);colNames.push('kpi__diff1');
-    cols.push(diff2);colNames.push('kpi__diff2');
-
-    // -- Calendar features (cyclical encoding + quarter) --
-    if(kpiDates && kpiDates.length===n){
-      const monthSin=new Array(n).fill(NaN), monthCos=new Array(n).fill(NaN);
-      const qtr=new Array(n).fill(NaN);
-      for(let i=0;i<n;i++){
-        const parts=kpiDates[i].split('-');
-        const m=parseInt(parts[1]);
-        if(!isNaN(m)){
-          monthSin[i]=Math.sin(2*Math.PI*m/12);
-          monthCos[i]=Math.cos(2*Math.PI*m/12);
-          qtr[i]=Math.ceil(m/3);
-        }
-      }
-      cols.push(monthSin);colNames.push('cal__month_sin');
-      cols.push(monthCos);colNames.push('cal__month_cos');
-      cols.push(qtr);colNames.push('cal__quarter');
-    }
-
-    // -- Feature interactions (products & ratios of raw features, capped) --
-    if(featureMatrix && featureMatrix.length===n){
-      const p=featureMatrix[0]?.length||0;
-      const maxInteractions=Math.min(10, Math.floor(p*(p-1)/2));
-      let count=0;
-      for(let a=0;a<p&&count<maxInteractions;a++){
-        for(let b=a+1;b<p&&count<maxInteractions;b++){
-          const prod=new Array(n).fill(NaN), ratio=new Array(n).fill(NaN);
-          for(let i=0;i<n;i++){
-            const va=featureMatrix[i][a], vb=featureMatrix[i][b];
-            prod[i]=va*vb;
-            ratio[i]=Math.abs(vb)>1e-9?va/vb:NaN;
-          }
-          const na=featureNames[a]||'f'+a, nb=featureNames[b]||'f'+b;
-          cols.push(prod);colNames.push(`${na}__x__${nb}`);
-          cols.push(ratio);colNames.push(`${na}__div__${nb}`);
-          count++;
-        }
-      }
-    }
-
-    // Target: shift by horizon
-    const yArr=new Array(n).fill(NaN);
-    for(let i=0;i<n-horizon;i++)yArr[i]=kpiValues[i+horizon];
-    // Build X, y (drop NaN rows)
-    const validIdx=[];
-    for(let i=0;i<n;i++){
-      if(isNaN(yArr[i]))continue;
-      let nanCount=0; for(const col of cols)if(isNaN(col[i]))nanCount++;
-      if(nanCount<cols.length*0.5)validIdx.push(i);
-    }
-    if(validIdx.length<15)return null;
-    const X=validIdx.map(i=>cols.map(col=>isNaN(col[i])?0:col[i]));
-    const yOut=validIdx.map(i=>yArr[i]);
-    return{X, y:yOut, colNames};
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // AUTO SETTINGS (matching app.py auto_settings)
-  // ══════════════════════════════════════════════════════════
-  function autoSettings(nRows, nFeatures) {
-    const nSplits = nRows<90 ? 2 : nRows<260 ? 3 : 5;
-    const minRows = nRows>=80 ? Math.max(30, 20) : Math.max(12, 15);
-
-    // Trials scaled to search-space complexity: Ridge=1 param, RF=4, MLP=5, XGB=9
-    const ridgeTrials = nRows<150 ? 8  : nRows<500 ? 10 : 15;
-    const xgbTrials   = nRows<150 ? 12 : nRows<600 ? 18 : 25;
-    const rfTrials    = nRows<150 ? 8  : nRows<500 ? 12 : 16;
-    const mlpTrials   = nRows<150 ? 8  : nRows<500 ? 12 : 16;
-
-    let kBest = 0;
-    if(nFeatures > 0){
-      const capByN = Math.max(5, Math.floor(0.25*nRows));
-      const base = Math.min(nFeatures, Math.max(10, Math.floor(Math.sqrt(nFeatures)*3)));
-      kBest = Math.min(base, capByN, nFeatures);
-    }
-
-    return {
-      nSplits, minRows, kBest,
-      ridgeTrials, xgbTrials, rfTrials, mlpTrials,
-      xgbNumBoostRound: 300,       // JS trees ~30x slower than C++ XGBoost; early stopping compensates
-      xgbEarlyStopRounds: 20
-    };
-  }
-
-  function lagPolicy(nRows) {
-    if(nRows<120) return {featureLags:[1,2],kpiLags:[1,2],rollingWindows:[2,3]};
-    if(nRows<500) return {featureLags:[1,2,3,6],kpiLags:[1,2,3,6],rollingWindows:[3,6]};
-    return {featureLags:[1,2,3,6,12],kpiLags:[1,2,3,6,12],rollingWindows:[3,6,12]};
-  }
-
-  // ══════════════════════════════════════════════════════════
-  // FULL FORECAST PIPELINE FOR A SINGLE KPI
-  // Like app.py predict_all_kpis_strong_tuning + select_best
-  // ══════════════════════════════════════════════════════════
-  function forecastSingleKPI(kpiValues, kpiDates, featureMatrix, featureNames, horizons, freq) {
-    const n = kpiValues.length;
-    const cfg = autoSettings(n, featureNames.length);
-    const lags = lagPolicy(n);
-    const results = [];
-
-    for(const h of horizons){
-      const sup = makeSupervised(kpiValues, featureMatrix, featureNames, h, lags, kpiDates);
-      if(!sup || sup.X.length < cfg.minRows) continue;
-      const {X, y, colNames} = sup;
-
-      const kBest = Math.min(cfg.kBest, X[0].length);
-
-      // ── COMMON OUTER SPLITS for fair comparison ──
-      const outerSplits = commonOuterSplits(X.length, cfg);
-      if(outerSplits.length < 2) continue;
-
-      // ── Nested eval ALL MODELS (SAME outer splits) ──
-      let ridgeResult, xgbResult, rfResult, mlpResult;
-      try { ridgeResult = nestedEvalRidge(X, y, cfg, kBest, outerSplits); }
-      catch(e){ ridgeResult = {mae:Infinity, rmse:Infinity}; }
-
-      try { xgbResult = nestedEvalXGB(X, y, cfg, kBest, outerSplits); }
-      catch(e){ xgbResult = {mae:Infinity, rmse:Infinity}; }
-
-      try { rfResult = nestedEvalRF(X, y, cfg, kBest, outerSplits); }
-      catch(e){ rfResult = {mae:Infinity, rmse:Infinity}; }
-
-      try { mlpResult = nestedEvalMLP(X, y, cfg, kBest, outerSplits); }
-      catch(e){ mlpResult = {mae:Infinity, rmse:Infinity}; }
-
-      // ── Final training on ALL data for actual forecast ──
-      // Shared preprocessing (impute + scale) fit on all data — same for every model.
-      // Each model then runs its OWN feature selection so it picks the subset that
-      // best suits its inductive bias (linear vs tree vs neural).
-      const X_imp = imputeMedian(X);
-      const sc = standardize(X_imp);
-      const X_sc = sc.X; // scaled, not yet feature-selected
-      const innerCfg = makeInnerCfg(cfg);
-
-      // Forecast date
-      let fcDate = kpiDates[kpiDates.length-1];
-      try{
-        const d=new Date(fcDate+'-01');
-        if(freq==='daily')d.setDate(d.getDate()+h);
-        else if(freq==='weekly')d.setDate(d.getDate()+h*7);
-        else d.setMonth(d.getMonth()+h);
-        fcDate=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
-      }catch(e){}
-
-      const lastValue = kpiValues[kpiValues.length-1];
-
-      // Final Ridge — own feature selection
-      let ridgeYhat = NaN, ridgeFeatNames = [];
-      try{
-        const bestRidge = tuneRidgeCV(X, y, innerCfg, cfg.ridgeTrials, kBest);
-        const sel = selectKBestMI(X_sc, y, kBest);
-        ridgeFeatNames = sel.idx.map(j=>colNames[j]);
-        const X_fs = sel.X;
-        const w = ridgeFit(X_fs, y, bestRidge.alpha);
-        ridgeYhat = ridgePredict([X_fs[X_fs.length-1]], w)[0];
-      }catch(e){}
-
-      // Final XGB — own feature selection, probe for optimal nRounds, retrain on ALL data
-      let xgbYhat = NaN, xgbFeatNames = [];
-      try{
-        const bestXGB = tuneXGBCV(X, y, innerCfg, cfg.xgbTrials, kBest);
-        const sel = selectKBestMI(X_sc, y, kBest);
-        xgbFeatNames = sel.idx.map(j=>colNames[j]);
-        const X_fs = sel.X;
-        let bestNTrees = Math.min(100, cfg.xgbNumBoostRound);
-        const xgbMinTr=15, xgbMinVa=5;
-        if(X_fs.length >= xgbMinTr+xgbMinVa){
-          const cut = clip(Math.floor(0.8*X_fs.length), xgbMinTr, X_fs.length-xgbMinVa);
-          try{
-            const probe = new XGBModel({...bestXGB, nRounds:cfg.xgbNumBoostRound, earlyStopRounds:cfg.xgbEarlyStopRounds});
-            probe.train(X_fs.slice(0,cut), y.slice(0,cut), X_fs.slice(cut), y.slice(cut));
-            bestNTrees = probe.bestNTrees;
-          }catch(e){}
-        }
-        const model = new XGBModel({...bestXGB, nRounds:bestNTrees, earlyStopRounds:9999});
-        model.train(X_fs, y, null, null);
-        xgbYhat = model.predict([X_fs[X_fs.length-1]])[0];
-      }catch(e){}
-
-      // Final Random Forest — own feature selection
-      let rfYhat = NaN, rfFeatNames = [];
-      try{
-        const bestRF = tuneRFCV(X, y, innerCfg, cfg.rfTrials, kBest);
-        const sel = selectKBestMI(X_sc, y, kBest);
-        rfFeatNames = sel.idx.map(j=>colNames[j]);
-        const X_fs = sel.X;
-        const rfModel = new RandomForestModel(bestRF);
-        rfModel.train(X_fs, y);
-        rfYhat = rfModel.predict([X_fs[X_fs.length-1]])[0];
-      }catch(e){}
-
-      // Final MLP — own feature selection, probe for optimal epochs, retrain on ALL data
-      let mlpYhat = NaN, mlpFeatNames = [];
-      try{
-        const bestMLPRaw = tuneMLPCV(X, y, innerCfg, cfg.mlpTrials, kBest);
-        const bestMLP = _toMLPParams(bestMLPRaw);
-        const sel = selectKBestMI(X_sc, y, kBest);
-        mlpFeatNames = sel.idx.map(j=>colNames[j]);
-        const X_fs = sel.X;
-        let bestEpochs = Math.min(50, bestMLP.epochs);
-        const mlpMinTr=12, mlpMinVa=5;
-        if(X_fs.length >= mlpMinTr+mlpMinVa){
-          const cut = clip(Math.floor(0.8*X_fs.length), mlpMinTr, X_fs.length-mlpMinVa);
-          try{
-            const probe = new MLPModel(bestMLP);
-            probe.train(X_fs.slice(0,cut), y.slice(0,cut), X_fs.slice(cut), y.slice(cut));
-            bestEpochs = probe.bestEpochs;
-          }catch(e){}
-        }
-        const mlpModel = new MLPModel({...bestMLP, epochs:bestEpochs, earlyStopPatience:9999});
-        mlpModel.train(X_fs, y, null, null);
-        mlpYhat = mlpModel.predict([X_fs[X_fs.length-1]])[0];
-      }catch(e){}
-
-      // ── Select best model by MAE_cv across all 4 models ──
-      const candidates = [
-        {name:'Ridge',   yhat:ridgeYhat, cv:ridgeResult, featNames:ridgeFeatNames},
-        {name:'XGBoost', yhat:xgbYhat,   cv:xgbResult,   featNames:xgbFeatNames},
-        {name:'RF',      yhat:rfYhat,    cv:rfResult,     featNames:rfFeatNames},
-        {name:'MLP',     yhat:mlpYhat,   cv:mlpResult,    featNames:mlpFeatNames},
-      ].filter(c => !isNaN(c.yhat) && c.cv.mae < Infinity);
-
-      if(!candidates.length) continue;
-
-      // Find the best MAE_cv
-      let bestMAE = Infinity;
-      for(const c of candidates) if(c.cv.mae < bestMAE) bestMAE = c.cv.mae;
-
-      for(const c of candidates){
-        results.push({
-          model: c.name, horizon: h, forecast_date: fcDate, last_value: lastValue,
-          forecast_value: c.yhat, MAE_cv: c.cv.mae, RMSE_cv: c.cv.rmse,
-          selected_features: c.featNames,
-          is_best: c.cv.mae === bestMAE
-        });
-      }
-    }
-    return results;
-  }
-
-  return {
-    mean, std, pearson, maeScore, rmseScore,
-    mutualInfoScore, selectKBestMI,
-    forecastSingleKPI, imputeMedian, standardize, applyScale,
-    autoSettings, lagPolicy, makeSupervised, tscvSplits, commonOuterSplits
-  };
-})();
 
 // ══════════════════════════════════════════════════════════════
 // RAW INPUT DATA → COMPUTE KPIs + ML FORECASTS
@@ -4271,208 +2621,177 @@ async function runComputeAll(sheets, moduleHorizons, detectedFreq, perKpiHorizon
   _sp(35,`Running ML forecasts (${allH.map(h=>'t+'+h).join(', ')})…`); await Y(30);
 
   // ══════════════════════════════════════════════════════════════
-  // ML FORECASTING (Ridge + XGBoost, nested CV, best model selection)
+  // ML FORECASTING — sent to Railway API (Python backend)
   // ══════════════════════════════════════════════════════════════
 
-  // Helper: build aligned feature matrix for a KPI series
   function buildAlignedFeatures(dates) {
     if(!featureColNames.length)return{matrix:null,names:[]};
     const mat=dates.map(ds=>featureDateMap[ds]||new Array(featureColNames.length).fill(0));
     return{matrix:mat,names:[...featureColNames]};
   }
 
-  // Helper: extract KPI time series from long-format history
   function extractSeries(histArr, kpiName) {
     const pts=histArr.filter(r=>r.KPI_target===kpiName).sort((a,b)=>a.period.localeCompare(b.period));
     return{dates:pts.map(p=>p.period),values:pts.map(p=>p.KPI_value)};
   }
 
-  // ── 8. FORECAST ECONOMIC ──
+  function _pearson(x, y) {
+    const n=Math.min(x.length,y.length); if(n<3)return 0;
+    let mx=0,my=0; for(let i=0;i<n;i++){mx+=x[i];my+=y[i];} mx/=n;my/=n;
+    let num=0,dx=0,dy=0;
+    for(let i=0;i<n;i++){num+=(x[i]-mx)*(y[i]-my);dx+=(x[i]-mx)**2;dy+=(y[i]-my)**2;}
+    const d=Math.sqrt(dx*dy); return d===0?0:num/d;
+  }
+
+  const apiSeries = [];
+
   if(C.history.length && hEco.length){
     _ss('fc_eco','running'); await Y(20);
     const ecoKPIs=[...new Set(C.history.map(r=>r.KPI_target))];
-    let done=0, forecasted=0;
     for(const kpi of ecoKPIs){
-      const kpiH = perKpiHorizons?.economic?.[kpi];
-      if(kpiH && kpiH.length === 0) { done++; continue; } // tracking → skip
-      const useH = (kpiH && kpiH.length) ? kpiH : hEco;
+      const kpiH=perKpiHorizons?.economic?.[kpi];
+      if(kpiH&&kpiH.length===0)continue;
+      const useH=(kpiH&&kpiH.length)?kpiH:hEco;
       const{dates,values}=extractSeries(C.history,kpi);
       const{matrix,names}=buildAlignedFeatures(dates);
-      try{
-        const results=ML.forecastSingleKPI(values,dates,matrix,names,useH,freq);
-        for(const r of results){
-          C.final.push({KPI_target:kpi,model:r.model,forecast_date_est:r.forecast_date,last_value:r.last_value,forecast_value:r.forecast_value,MAE_cv:r.MAE_cv,RMSE_cv:r.RMSE_cv});
-          // Correlations from selected features
-          if(r.is_best&&r.selected_features){
-            for(const feat of r.selected_features){
-              const fIdx=featureColNames.indexOf(feat.replace(/__lag\d+|__rm\d+|__rs\d+/,''));
-              const fVals=dates.map(ds=>(featureDateMap[ds]||[])[fIdx>=0?fIdx:0]||0);
-              const corr=ML.pearson(values.slice(0,Math.min(values.length,fVals.length)),fVals.slice(0,Math.min(values.length,fVals.length)));
-              if(!isNaN(corr))C.featcorr.push({kpi,features:feat,'forecast date':r.forecast_date,correlation:corr});
-            }
-          }
-        }
-      }catch(e){console.warn('Eco forecast error:',kpi,e);}
-      done++; forecasted++;
-      _ss('fc_eco','running',`${forecasted}/${ecoKPIs.length - (done - forecasted)}`);
-      await Y(16);
+      apiSeries.push({kpi_name:kpi,kpi_values:values,kpi_dates:dates,feature_matrix:matrix,feature_names:names,horizons:useH,freq,module:'economic'});
     }
-    _ss('fc_eco','done',`${forecasted} KPIs`);
+    _ss('fc_eco','done',ecoKPIs.length+' KPIs queued');
   }else _ss('fc_eco','skip');
-  _sp(50,'Forecasting CS…'); await Y(20);
 
-  // ── 9. FORECAST CUSTOMER SERVICE ──
   if(C.cshistory.length && hCS.length){
     _ss('fc_cs','running'); await Y(20);
     const csKPIs=[...new Set(C.cshistory.map(r=>r.KPI_target))];
-    let done=0, csFcCount=0;
     for(const kpi of csKPIs){
-      const kpiH = perKpiHorizons?.cs?.[kpi];
-      if(kpiH && kpiH.length === 0) { done++; continue; }
-      const useH = (kpiH && kpiH.length) ? kpiH : hCS;
+      const kpiH=perKpiHorizons?.cs?.[kpi];
+      if(kpiH&&kpiH.length===0)continue;
+      const useH=(kpiH&&kpiH.length)?kpiH:hCS;
       const{dates,values}=extractSeries(C.cshistory,kpi);
       const{matrix,names}=buildAlignedFeatures(dates);
-      try{
-        const results=ML.forecastSingleKPI(values,dates,matrix,names,useH,freq);
-        for(const r of results){
-          C.csfinal.push({KPI_target:kpi,model:r.model,forecast_date_est:r.forecast_date,last_value:r.last_value,forecast_value:r.forecast_value,MAE_cv:r.MAE_cv,RMSE_cv:r.RMSE_cv});
-          if(r.is_best&&r.selected_features){
-            for(const feat of r.selected_features){
-              const fIdx=featureColNames.indexOf(feat.replace(/__lag\d+|__rm\d+|__rs\d+/,''));
-              const fVals=dates.map(ds=>(featureDateMap[ds]||[])[fIdx>=0?fIdx:0]||0);
-              const corr=ML.pearson(values.slice(0,Math.min(values.length,fVals.length)),fVals.slice(0,Math.min(values.length,fVals.length)));
-              if(!isNaN(corr))C.csfeatcorr.push({kpi,features:feat,'forecast date':r.forecast_date,correlation:corr});
-            }
-          }
-        }
-      }catch(e){}
-      done++;csFcCount++;_ss('fc_cs','running',`${csFcCount}/${csKPIs.length - (done - csFcCount)}`); await Y(16);
+      apiSeries.push({kpi_name:kpi,kpi_values:values,kpi_dates:dates,feature_matrix:matrix,feature_names:names,horizons:useH,freq,module:'cs'});
     }
-    _ss('fc_cs','done',`${csFcCount} KPIs`);
+    _ss('fc_cs','done',csKPIs.length+' KPIs queued');
   }else _ss('fc_cs','skip');
-  _sp(60,'Forecasting suppliers…'); await Y(20);
 
-  // ── 10. FORECAST SUPPLIERS ──
   if(supplierSheets.length && hSup.length){
     _ss('fc_sup','running'); await Y(20);
-    let supDone=0;
     for(const sN of supplierSheets){
       if(!C.suphistory[sN])continue;
       const rows=C.suphistory[sN];
       const kpiNames=Object.keys(rows[0]||{}).filter(k=>k!=='period');
-      const fcRows=[],corrRows=[];
       for(const kpi of kpiNames){
-        const kpiH = perKpiHorizons?.supplier?.[kpi];
-        if(kpiH && kpiH.length === 0) continue;
-        const useH = (kpiH && kpiH.length) ? kpiH : hSup;
+        const kpiH=perKpiHorizons?.supplier?.[kpi];
+        if(kpiH&&kpiH.length===0)continue;
+        const useH=(kpiH&&kpiH.length)?kpiH:hSup;
         const pts=rows.filter(r=>r[kpi]!=null&&!isNaN(r[kpi])).sort((a,b)=>a.period.localeCompare(b.period));
         if(pts.length<10)continue;
-        const dates=pts.map(p=>p.period),values=pts.map(p=>p[kpi]);
-        const{matrix,names}=buildAlignedFeatures(dates);
-        try{
-          const results=ML.forecastSingleKPI(values,dates,matrix,names,useH,freq);
-          for(const r of results){
-            fcRows.push({KPI_target:kpi,model:r.model,forecast_date_est:r.forecast_date,last_value:r.last_value,forecast_value:r.forecast_value,MAE_cv:r.MAE_cv,RMSE_cv:r.RMSE_cv});
-            if(r.is_best&&r.selected_features){
-              for(const feat of r.selected_features){
-                const fIdx=featureColNames.indexOf(feat.replace(/__lag\d+|__rm\d+|__rs\d+/,''));
-                const fVals=dates.map(ds=>(featureDateMap[ds]||[])[fIdx>=0?fIdx:0]||0);
-                const corr=ML.pearson(values,fVals.slice(0,values.length));
-                if(!isNaN(corr))corrRows.push({kpi,features:feat,'forecast date':r.forecast_date,correlation:corr});
-              }
-            }
-          }
-        }catch(e){}
+        apiSeries.push({kpi_name:kpi+'||'+sN,kpi_values:pts.map(p=>p[kpi]),kpi_dates:pts.map(p=>p.period),feature_matrix:buildAlignedFeatures(pts.map(p=>p.period)).matrix,feature_names:featureColNames,horizons:useH,freq,module:'supplier'});
       }
-      C.supfinal[sN]=fcRows;
-      C.supfeatcorr[sN]=corrRows;
-      supDone++;_ss('fc_sup','running',`${supDone}/${supplierSheets.length}`); await Y(16);
     }
-    _ss('fc_sup','done',`${supplierSheets.length} suppliers`);
+    _ss('fc_sup','done',supplierSheets.length+' suppliers queued');
   }else _ss('fc_sup','skip');
-  _sp(75,'Forecasting operational…'); await Y(20);
 
-  // ── 11. FORECAST OPERATIONAL ──
   const opEntities=[...warehouseSheets,...factorySheets];
   if(opEntities.length && hOp.length){
     _ss('fc_op','running'); await Y(20);
-    let opDone=0;
     for(const entity of opEntities){
       if(!C.ophistory[entity])continue;
       const rows=C.ophistory[entity];
       const kpiNames=Object.keys(rows[0]||{}).filter(k=>k!=='period');
-      const fcRows=[],corrRows=[];
       for(const kpi of kpiNames){
-        const kpiH = perKpiHorizons?.operational?.[kpi];
-        if(kpiH && kpiH.length === 0) continue;
-        const useH = (kpiH && kpiH.length) ? kpiH : hOp;
+        const kpiH=perKpiHorizons?.operational?.[kpi];
+        if(kpiH&&kpiH.length===0)continue;
+        const useH=(kpiH&&kpiH.length)?kpiH:hOp;
         const pts=rows.filter(r=>r[kpi]!=null&&!isNaN(r[kpi])).sort((a,b)=>a.period.localeCompare(b.period));
         if(pts.length<10)continue;
-        const dates=pts.map(p=>p.period),values=pts.map(p=>p[kpi]);
-        const{matrix,names}=buildAlignedFeatures(dates);
-        try{
-          const results=ML.forecastSingleKPI(values,dates,matrix,names,useH,freq);
-          for(const r of results){
-            fcRows.push({KPI_target:kpi,model:r.model,forecast_date_est:r.forecast_date,last_value:r.last_value,forecast_value:r.forecast_value,MAE_cv:r.MAE_cv,RMSE_cv:r.RMSE_cv});
-            if(r.is_best&&r.selected_features){
-              for(const feat of r.selected_features){
-                const fIdx=featureColNames.indexOf(feat.replace(/__lag\d+|__rm\d+|__rs\d+/,''));
-                const fVals=dates.map(ds=>(featureDateMap[ds]||[])[fIdx>=0?fIdx:0]||0);
-                const corr=ML.pearson(values,fVals.slice(0,values.length));
-                if(!isNaN(corr))corrRows.push({kpi,features:feat,'forecast date':r.forecast_date,correlation:corr});
-              }
-            }
-          }
-        }catch(e){}
+        apiSeries.push({kpi_name:kpi+'||'+entity,kpi_values:pts.map(p=>p[kpi]),kpi_dates:pts.map(p=>p.period),feature_matrix:buildAlignedFeatures(pts.map(p=>p.period)).matrix,feature_names:featureColNames,horizons:useH,freq,module:'operational'});
       }
-      C.opfinal[entity]=fcRows;
-      C.opfeatcorr[entity]=corrRows;
-      opDone++;_ss('fc_op','running',`${opDone}/${opEntities.length}`); await Y(16);
     }
-    _ss('fc_op','done',`${opEntities.length} entities`);
+    _ss('fc_op','done',opEntities.length+' entities queued');
   }else _ss('fc_op','skip');
-  _sp(85,'Forecasting SKU…'); await Y(20);
 
-  // ── 12. FORECAST SKU (per SKU) ──
   if(C.skuhistory.length && hSKU.length){
     _ss('fc_sku','running'); await Y(20);
     const skuIds=[...new Set(C.skuhistory.map(r=>r.sku_id))];
-    const skuFcKPIs=['SKU Demand','SKU Inventory Coverage','Service Level'].filter(kpi => {
-      const kpiH = perKpiHorizons?.sku?.[kpi];
-      return !kpiH || kpiH.length > 0; // keep if no config or has horizons
-    });
-    let skuDone=0;
+    const skuFcKPIs=['SKU Demand','SKU Inventory Coverage','Service Level'].filter(kpi=>{const kpiH=perKpiHorizons?.sku?.[kpi];return !kpiH||kpiH.length>0;});
     for(const sid of skuIds){
       const skuData=C.skuhistory.filter(r=>r.sku_id===sid).sort((a,b)=>a.period.localeCompare(b.period));
       for(const kpi of skuFcKPIs){
-        const kpiH = perKpiHorizons?.sku?.[kpi];
-        const useH = (kpiH && kpiH.length) ? kpiH : hSKU;
+        const kpiH=perKpiHorizons?.sku?.[kpi];
+        const useH=(kpiH&&kpiH.length)?kpiH:hSKU;
         const pts=skuData.filter(r=>r[kpi]!=null&&!isNaN(r[kpi]));
         if(pts.length<10)continue;
-        const dates=pts.map(p=>p.period),values=pts.map(p=>p[kpi]);
-        const{matrix,names}=buildAlignedFeatures(dates);
-        try{
-          const results=ML.forecastSingleKPI(values,dates,matrix,names,useH,freq);
-          for(const r of results){
-            C.skufinal.push({sku_id:sid,KPI_target:kpi,model:r.model,horizon_steps:r.horizon,forecast_date_est:r.forecast_date,last_value:r.last_value,forecast_value:r.forecast_value,MAE_cv:r.MAE_cv,RMSE_cv:r.RMSE_cv});
-            // SKU correlations
-            if(r.is_best&&r.selected_features){
-              for(const feat of r.selected_features){
-                const fIdx=featureColNames.indexOf(feat.replace(/__lag\d+|__rm\d+|__rs\d+/,''));
-                const fVals=dates.map(ds=>(featureDateMap[ds]||[])[fIdx>=0?fIdx:0]||0);
-                const corr=ML.pearson(values,fVals.slice(0,values.length));
-                if(!isNaN(corr))C.skufeatcorr.push({sku_id:sid,kpi,horizon_steps:r.horizon,'forecast date':r.forecast_date,features:feat,correlation:corr});
+        apiSeries.push({kpi_name:kpi+'||SKU||'+sid,kpi_values:pts.map(p=>p[kpi]),kpi_dates:pts.map(p=>p.period),feature_matrix:buildAlignedFeatures(pts.map(p=>p.period)).matrix,feature_names:featureColNames,horizons:useH,freq,module:'sku'});
+      }
+    }
+    _ss('fc_sku','done',skuIds.length+' SKUs queued');
+  }else _ss('fc_sku','skip');
+
+  // ── SEND ALL SERIES TO RAILWAY API ──
+  _sp(40,'Sending '+apiSeries.length+' KPIs to ML server…'); await Y(30);
+  if(apiSeries.length > 0 && typeof _currentSession !== 'undefined' && _currentSession) {
+    try {
+      _sp(45,'ML pipeline running on server… This may take a few minutes.');
+      const resp = await fetch(API_BASE + '/upload', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + _currentSession.access_token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ series: apiSeries }),
+      });
+      if(!resp.ok) { const err = await resp.json(); throw new Error(err.detail || 'API error'); }
+      const apiResults = await resp.json();
+      _sp(85, apiResults.cached ? 'Loaded from cache' : 'ML complete in '+apiResults.computation_time_s+'s');
+
+      // Process API results back into C.final, C.csfinal, C.supfinal, C.opfinal, C.skufinal
+      if(apiResults.results && apiResults.results.kpis) {
+        for(const [key, data] of Object.entries(apiResults.results.kpis)) {
+          if(!data.forecasts) continue;
+          for(const r of data.forecasts) {
+            const mod = r.model || 'Unknown';
+            const fcRow = { model:mod, forecast_date_est:r.forecast_date, last_value:r.last_value, forecast_value:r.forecast_value, MAE_cv:r.MAE_cv, RMSE_cv:r.RMSE_cv };
+
+            // Parse the key: "module__kpiName" or the series module field
+            const seriesMatch = apiSeries.find(s => key === s.module + '__' + s.kpi_name);
+            const module = seriesMatch ? seriesMatch.module : key.split('__')[0];
+            const rawName = seriesMatch ? seriesMatch.kpi_name : key.replace(module+'__','');
+
+            if(module === 'economic') {
+              C.final.push({...fcRow, KPI_target: rawName});
+            } else if(module === 'cs') {
+              C.csfinal.push({...fcRow, KPI_target: rawName});
+            } else if(module === 'supplier') {
+              const pp = rawName.split('||'); const kpiName=pp[0], supSheet=pp[1]||'';
+              if(!C.supfinal[supSheet]) C.supfinal[supSheet]=[];
+              C.supfinal[supSheet].push({...fcRow, KPI_target:kpiName});
+            } else if(module === 'operational') {
+              const pp = rawName.split('||'); const kpiName=pp[0], entity=pp[1]||'';
+              if(!C.opfinal[entity]) C.opfinal[entity]=[];
+              C.opfinal[entity].push({...fcRow, KPI_target:kpiName});
+            } else if(module === 'sku') {
+              const skuMatch = rawName.match(/^(.+?)\|\|SKU\|\|(.+)$/);
+              if(skuMatch) {
+                C.skufinal.push({...fcRow, KPI_target:skuMatch[1], sku_id:skuMatch[2], horizon_steps:r.horizon});
               }
             }
           }
-        }catch(e){}
+          // Correlations
+          for(const corr of (data.correlations||[])) {
+            const corrRow = {kpi:corr.kpi, features:corr.feature, 'forecast date':corr.forecast_date, correlation:corr.correlation};
+            const seriesMatch = apiSeries.find(s => key === s.module + '__' + s.kpi_name);
+            const module = seriesMatch ? seriesMatch.module : key.split('__')[0];
+            if(module==='economic') C.featcorr.push(corrRow);
+            else if(module==='cs') C.csfeatcorr.push(corrRow);
+            else if(module==='sku') C.skufeatcorr.push(corrRow);
+          }
+        }
       }
-      skuDone++;
-      _ss('fc_sku','running',`${skuDone}/${skuIds.length}`);await Y(16);
+    } catch(apiErr) {
+      console.error('API error:', apiErr);
+      _sp(85, 'API error: ' + apiErr.message);
     }
-    _ss('fc_sku','done',`${skuIds.length} SKUs`);
-  }else _ss('fc_sku','skip');
-  _sp(92,'Correlations…'); await Y(20);
+  } else {
+    _sp(85, apiSeries.length ? 'Not logged in — skipped' : 'No KPIs to forecast');
+  }
+  _sp(90,'Building dashboard…'); await Y(20);
 
   // ── 13. CORRELATIONS (already computed inline above) ──
   _ss('correlations','done',`Eco:${C.featcorr.length} CS:${C.csfeatcorr.length} SKU:${C.skufeatcorr.length}`);
