@@ -1449,20 +1449,14 @@ async function deleteAccount() {
   if (!doubleCheck) return;
 
   try {
-    const token = _currentSession.access_token;
-    const uid = _currentSession.user.id;
-
-    // Delete user data from Supabase tables
-    await fetch(SUPABASE_URL + '/rest/v1/ml_results?user_id=eq.' + uid, {
+    // Call API to delete account (server-side with admin privileges)
+    const resp = await fetch(API_BASE + '/account', {
       method: 'DELETE',
-      headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': 'Bearer ' + token }
+      headers: { 'Authorization': 'Bearer ' + _currentSession.access_token }
     });
-    await fetch(SUPABASE_URL + '/rest/v1/users_data?user_id=eq.' + uid, {
-      method: 'DELETE',
-      headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': 'Bearer ' + token }
-    });
+    const data = await resp.json();
 
-    // Sign out
+    // Sign out locally
     await _supabase.auth.signOut();
     _currentSession = null;
 
@@ -1470,7 +1464,7 @@ async function deleteAccount() {
     document.getElementById('loginPage').classList.remove('hidden');
     document.getElementById('appMain').classList.remove('visible');
     const succEl = document.getElementById('loginSuccess');
-    succEl.textContent = 'Account data deleted. Contact support to fully remove your account.';
+    succEl.textContent = data.deleted ? 'Account permanently deleted.' : 'Data deleted. ' + (data.message || '');
     succEl.style.display = 'block';
   } catch (err) {
     alert('Error deleting account: ' + err.message);
@@ -2727,61 +2721,94 @@ async function runComputeAll(sheets, moduleHorizons, detectedFreq, perKpiHorizon
     _ss('fc_sku','done',skuIds.length+' SKUs queued');
   }else _ss('fc_sku','skip');
 
-  // ── SEND ALL SERIES TO RAILWAY API ──
+  // ── SEND ALL SERIES TO RAILWAY API (async with polling) ──
   _sp(40,'Sending '+apiSeries.length+' KPIs to ML server…'); await Y(30);
   if(apiSeries.length > 0 && typeof _currentSession !== 'undefined' && _currentSession) {
     try {
-      _sp(45,'ML pipeline running on server… This may take a few minutes.');
-      const resp = await fetch(API_BASE + '/upload', {
+      // Step 1: Submit task
+      const submitResp = await fetch(API_BASE + '/upload', {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + _currentSession.access_token, 'Content-Type': 'application/json' },
         body: JSON.stringify({ series: apiSeries }),
       });
-      if(!resp.ok) { const err = await resp.json(); throw new Error(err.detail || 'API error'); }
-      const apiResults = await resp.json();
-      _sp(85, apiResults.cached ? 'Loaded from cache' : 'ML complete in '+apiResults.computation_time_s+'s');
+      if(!submitResp.ok) { const err = await submitResp.json(); throw new Error(err.detail || 'API error'); }
+      const submitData = await submitResp.json();
+      const taskId = submitData.task_id;
 
-      // Process API results back into C.final, C.csfinal, C.supfinal, C.opfinal, C.skufinal
-      if(apiResults.results && apiResults.results.kpis) {
-        for(const [key, data] of Object.entries(apiResults.results.kpis)) {
-          if(!data.forecasts) continue;
-          for(const r of data.forecasts) {
-            const mod = r.model || 'Unknown';
-            const fcRow = { model:mod, forecast_date_est:r.forecast_date, last_value:r.last_value, forecast_value:r.forecast_value, MAE_cv:r.MAE_cv, RMSE_cv:r.RMSE_cv };
+      if(submitData.cached) {
+        // Cache hit — results are already in the response
+        _sp(50, 'Loaded from cache');
+        const statusResp = await fetch(API_BASE + '/status/' + taskId, {
+          headers: { 'Authorization': 'Bearer ' + _currentSession.access_token }
+        });
+        const statusData = await statusResp.json();
+        var apiResults = statusData;
+      } else {
+        // Step 2: Poll for progress
+        _sp(45, 'ML pipeline running on server…');
+        var apiResults = null;
+        while(true) {
+          await Y(10000); // Poll every 10 seconds
+          const statusResp = await fetch(API_BASE + '/status/' + taskId, {
+            headers: { 'Authorization': 'Bearer ' + _currentSession.access_token }
+          });
+          if(!statusResp.ok) throw new Error('Status check failed');
+          const status = await statusResp.json();
 
-            // Parse the key: "module__kpiName" or the series module field
-            const seriesMatch = apiSeries.find(s => key === s.module + '__' + s.kpi_name);
-            const module = seriesMatch ? seriesMatch.module : key.split('__')[0];
-            const rawName = seriesMatch ? seriesMatch.kpi_name : key.replace(module+'__','');
+          if(status.status === 'done') {
+            apiResults = status;
+            break;
+          } else if(status.status === 'error') {
+            throw new Error(status.error || 'ML pipeline failed');
+          } else {
+            // Update progress bar
+            const pct = 45 + Math.round((status.percent || 0) * 0.40); // Map 0-100% to 45-85%
+            const kpiLabel = status.current_kpi ? ' · ' + status.current_kpi : '';
+            _sp(pct, 'ML running… ' + (status.progress||0) + '/' + (status.total||'?') + ' KPIs' + kpiLabel);
+          }
+        }
+      }
 
-            if(module === 'economic') {
-              C.final.push({...fcRow, KPI_target: rawName});
-            } else if(module === 'cs') {
-              C.csfinal.push({...fcRow, KPI_target: rawName});
-            } else if(module === 'supplier') {
-              const pp = rawName.split('||'); const kpiName=pp[0], supSheet=pp[1]||'';
-              if(!C.supfinal[supSheet]) C.supfinal[supSheet]=[];
-              C.supfinal[supSheet].push({...fcRow, KPI_target:kpiName});
-            } else if(module === 'operational') {
-              const pp = rawName.split('||'); const kpiName=pp[0], entity=pp[1]||'';
-              if(!C.opfinal[entity]) C.opfinal[entity]=[];
-              C.opfinal[entity].push({...fcRow, KPI_target:kpiName});
-            } else if(module === 'sku') {
-              const skuMatch = rawName.match(/^(.+?)\|\|SKU\|\|(.+)$/);
-              if(skuMatch) {
-                C.skufinal.push({...fcRow, KPI_target:skuMatch[1], sku_id:skuMatch[2], horizon_steps:r.horizon});
-              }
+      _sp(85, apiResults.cached ? 'Loaded from cache' : 'ML complete in '+(apiResults.computation_time_s||0)+'s');
+
+      // Step 3: Process API results back into C.final, C.csfinal, etc.
+      const kpis = apiResults.results && apiResults.results.kpis ? apiResults.results.kpis : {};
+      for(const [key, data] of Object.entries(kpis)) {
+        if(!data.forecasts) continue;
+        for(const r of data.forecasts) {
+          const mod = r.model || 'Unknown';
+          const fcRow = { model:mod, forecast_date_est:r.forecast_date, last_value:r.last_value, forecast_value:r.forecast_value, MAE_cv:r.MAE_cv, RMSE_cv:r.RMSE_cv };
+
+          const seriesMatch = apiSeries.find(s => key === s.module + '__' + s.kpi_name);
+          const module = seriesMatch ? seriesMatch.module : key.split('__')[0];
+          const rawName = seriesMatch ? seriesMatch.kpi_name : key.replace(module+'__','');
+
+          if(module === 'economic') {
+            C.final.push({...fcRow, KPI_target: rawName});
+          } else if(module === 'cs') {
+            C.csfinal.push({...fcRow, KPI_target: rawName});
+          } else if(module === 'supplier') {
+            const pp = rawName.split('||'); const kpiName=pp[0], supSheet=pp[1]||'';
+            if(!C.supfinal[supSheet]) C.supfinal[supSheet]=[];
+            C.supfinal[supSheet].push({...fcRow, KPI_target:kpiName});
+          } else if(module === 'operational') {
+            const pp = rawName.split('||'); const kpiName=pp[0], entity=pp[1]||'';
+            if(!C.opfinal[entity]) C.opfinal[entity]=[];
+            C.opfinal[entity].push({...fcRow, KPI_target:kpiName});
+          } else if(module === 'sku') {
+            const skuMatch = rawName.match(/^(.+?)\|\|SKU\|\|(.+)$/);
+            if(skuMatch) {
+              C.skufinal.push({...fcRow, KPI_target:skuMatch[1], sku_id:skuMatch[2], horizon_steps:r.horizon});
             }
           }
-          // Correlations
-          for(const corr of (data.correlations||[])) {
-            const corrRow = {kpi:corr.kpi, features:corr.feature, 'forecast date':corr.forecast_date, correlation:corr.correlation};
-            const seriesMatch = apiSeries.find(s => key === s.module + '__' + s.kpi_name);
-            const module = seriesMatch ? seriesMatch.module : key.split('__')[0];
-            if(module==='economic') C.featcorr.push(corrRow);
-            else if(module==='cs') C.csfeatcorr.push(corrRow);
-            else if(module==='sku') C.skufeatcorr.push(corrRow);
-          }
+        }
+        for(const corr of (data.correlations||[])) {
+          const corrRow = {kpi:corr.kpi, features:corr.feature, 'forecast date':corr.forecast_date, correlation:corr.correlation};
+          const seriesMatch = apiSeries.find(s => key === s.module + '__' + s.kpi_name);
+          const module = seriesMatch ? seriesMatch.module : key.split('__')[0];
+          if(module==='economic') C.featcorr.push(corrRow);
+          else if(module==='cs') C.csfeatcorr.push(corrRow);
+          else if(module==='sku') C.skufeatcorr.push(corrRow);
         }
       }
     } catch(apiErr) {
