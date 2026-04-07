@@ -550,7 +550,7 @@ header {
     <span id="headerMeta" style="margin-left:10px">No data — please import</span>
     <span id="userEmail" style="margin-left:10px;font-size:11px;color:var(--muted)"></span>
     <button class="logout-btn" onclick="logoutUser()">Logout</button>
-    <button class="logout-btn" onclick="deleteAccount()" style="border-color:#fca5a5;color:var(--danger);">Delete account</button>
+    <button class="logout-btn" onclick="resetDashboard()" style="border-color:#fca5a5;color:var(--danger);">Reset dashboard</button>
   </div>
 </header>
 
@@ -1465,31 +1465,7 @@ async function updatePassword() {
   }
 }
 
-// ── Delete account ──
-async function deleteAccount() {
-  if (!confirm('Are you sure you want to delete your account?\n\nThis will permanently delete all your saved data and forecast results.\n\nThis action cannot be undone.')) return;
-  if (!confirm('Last chance — this is irreversible. Delete everything?')) return;
-
-  try {
-    const token = _currentSession.access_token;
-    const uid = _currentSession.user.id;
-    await fetch(SUPABASE_URL + '/rest/v1/ml_results?user_id=eq.' + uid, {
-      method: 'DELETE', headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': 'Bearer ' + token }
-    });
-    await fetch(SUPABASE_URL + '/rest/v1/users_data?user_id=eq.' + uid, {
-      method: 'DELETE', headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': 'Bearer ' + token }
-    });
-    await _supabase.auth.signOut();
-    _currentSession = null;
-    document.getElementById('loginPage').classList.remove('hidden');
-    document.getElementById('appMain').classList.remove('visible');
-    const succEl = document.getElementById('loginSuccess');
-    succEl.textContent = 'All your data has been deleted. Your session is now closed.';
-    succEl.style.display = 'block';
-  } catch (err) {
-    alert('Error deleting account: ' + err.message);
-  }
-}
+// ── Delete account removed — replaced by resetDashboard ──
 
 // ── Save dashboard state to Supabase ──
 async function saveStateToCloud() {
@@ -1590,26 +1566,61 @@ async function loadSavedResults() {
 
 // ── Auto-login / password recovery detection ──
 (async () => {
+  // Detect recovery mode BEFORE Supabase processes the hash
+  const hash = window.location.hash;
+  const isRecovery = hash && hash.includes('type=recovery');
+
+  // Listen for auth state changes
   _supabase.auth.onAuthStateChange((event, session) => {
     if (session) _currentSession = session;
     if (event === 'PASSWORD_RECOVERY') {
-      document.getElementById('loginPage').classList.remove('hidden');
-      document.getElementById('appMain').classList.remove('visible');
-      document.querySelector('#loginPage > .login-card').style.display = 'none';
-      document.getElementById('forgotCard').style.display = 'none';
-      document.getElementById('newPasswordCard').style.display = 'block';
+      showNewPasswordForm();
     }
   });
 
+  // If URL has recovery hash, show the new password form immediately
+  if (isRecovery) {
+    // Wait a tick for Supabase to process the session
+    setTimeout(() => showNewPasswordForm(), 100);
+    return;
+  }
+
+  // Normal flow: check if session exists
   const { data } = await _supabase.auth.getSession();
   if (data.session) {
     _currentSession = data.session;
-    const hash = window.location.hash;
-    if (!hash || !hash.includes('type=recovery')) {
-      onLoginSuccess();
-    }
+    onLoginSuccess();
   }
 })();
+
+function showNewPasswordForm() {
+  document.getElementById('loginPage').classList.remove('hidden');
+  document.getElementById('appMain').classList.remove('visible');
+  const mainCard = document.querySelector('#loginPage > .login-card');
+  if (mainCard) mainCard.style.display = 'none';
+  document.getElementById('forgotCard').style.display = 'none';
+  document.getElementById('newPasswordCard').style.display = 'block';
+}
+
+// ── Reset dashboard (deletes saved data, keeps account) ──
+async function resetDashboard() {
+  if (!confirm('Reset your dashboard?\n\nThis will permanently delete all your saved data and forecast results from the cloud.\n\nYour account will remain active — you can upload new data afterwards.')) return;
+
+  try {
+    const token = _currentSession.access_token;
+    const uid = _currentSession.user.id;
+    await fetch(SUPABASE_URL + '/rest/v1/ml_results?user_id=eq.' + uid, {
+      method: 'DELETE', headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': 'Bearer ' + token }
+    });
+    await fetch(SUPABASE_URL + '/rest/v1/users_data?user_id=eq.' + uid, {
+      method: 'DELETE', headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': 'Bearer ' + token }
+    });
+    // Reload the page to get a clean slate
+    window.location.reload();
+  } catch (err) {
+    alert('Error resetting dashboard: ' + err.message);
+  }
+}
 
 // ══════════════════════════════════════════════════════════════
 // KNOWN CONFIGS
