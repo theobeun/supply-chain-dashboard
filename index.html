@@ -484,6 +484,10 @@ header {
       <label>Password</label>
       <input type="password" id="loginPassword" placeholder="••••••••" onkeydown="if(event.key==='Enter')authAction()">
     </div>
+    <div class="login-field" id="confirmPasswordField" style="display:none">
+      <label>Confirm password</label>
+      <input type="password" id="loginPasswordConfirm" placeholder="••••••••" onkeydown="if(event.key==='Enter')authAction()">
+    </div>
     <button class="login-btn" id="loginBtn" onclick="authAction()">Sign in</button>
     <div class="login-error" id="loginError"></div>
     <div class="login-success" id="loginSuccess"></div>
@@ -1342,6 +1346,8 @@ function toggleAuthMode() {
     ? 'No account? <a onclick="toggleAuthMode()">Create one</a>'
     : 'Already have an account? <a onclick="toggleAuthMode()">Sign in</a>';
   document.getElementById('forgotLink').style.display = _authMode === 'login' ? '' : 'none';
+  document.getElementById('confirmPasswordField').style.display = _authMode === 'signup' ? '' : 'none';
+  document.getElementById('loginPasswordConfirm').value = '';
   document.getElementById('loginError').style.display = 'none';
   document.getElementById('loginSuccess').style.display = 'none';
 }
@@ -1356,6 +1362,13 @@ async function authAction() {
   if (!email || !password) { errEl.textContent = 'Please fill in both fields'; errEl.style.display = 'block'; return; }
   if (password.length < 6) { errEl.textContent = 'Password must be at least 6 characters'; errEl.style.display = 'block'; return; }
 
+  // Signup: validate password confirmation
+  if (_authMode === 'signup') {
+    const passwordConfirm = document.getElementById('loginPasswordConfirm').value;
+    if (!passwordConfirm) { errEl.textContent = 'Please confirm your password'; errEl.style.display = 'block'; return; }
+    if (password !== passwordConfirm) { errEl.textContent = 'Passwords do not match'; errEl.style.display = 'block'; return; }
+  }
+
   const btn = document.getElementById('loginBtn');
   btn.textContent = _authMode === 'login' ? 'Signing in…' : 'Creating account…';
   btn.disabled = true;
@@ -1366,13 +1379,33 @@ async function authAction() {
       : await _supabase.auth.signInWithPassword({ email, password });
     if (result.error) throw result.error;
 
-    if (_authMode === 'signup' && !result.data.session) {
-      succEl.textContent = 'Account created! Check your email to confirm, then sign in.';
-      succEl.style.display = 'block';
-      _authMode = 'login';
-      btn.textContent = 'Sign in'; btn.disabled = false;
-      return;
+    if (_authMode === 'signup') {
+      // Supabase returns a user with empty identities array when the email already exists
+      // (to prevent email enumeration attacks)
+      const user = result.data.user;
+      if (user && user.identities && user.identities.length === 0) {
+        errEl.textContent = 'An account with this email already exists. Please sign in instead.';
+        errEl.style.display = 'block';
+        btn.textContent = 'Create account';
+        btn.disabled = false;
+        return;
+      }
+
+      if (!result.data.session) {
+        succEl.textContent = 'Account created! Check your email to confirm, then sign in.';
+        succEl.style.display = 'block';
+        _authMode = 'login';
+        document.getElementById('loginTitle').textContent = 'Sign in';
+        document.getElementById('loginSubtitle').textContent = 'Enter your credentials to access the dashboard';
+        document.getElementById('loginSwitch').innerHTML = 'No account? <a onclick="toggleAuthMode()">Create one</a>';
+        document.getElementById('forgotLink').style.display = '';
+        document.getElementById('confirmPasswordField').style.display = 'none';
+        document.getElementById('loginPasswordConfirm').value = '';
+        btn.textContent = 'Sign in'; btn.disabled = false;
+        return;
+      }
     }
+
     _currentSession = result.data.session;
     onLoginSuccess();
   } catch (err) {
